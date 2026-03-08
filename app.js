@@ -129,6 +129,7 @@ const ADAPTIVE_COORDINATION_BONUS = 0.8;
 const SIGNAL_YELLOW_DURATION = 1.4;
 const SIGNAL_ALL_RED_DURATION = 0.7;
 const YELLOW_CLEARANCE_DISTANCE = STOP_BUFFER + 6;
+const STUCK_TICKS_RELAXED_ENTRY = 90;
 const SIGNAL_MODE_VALUES = ['none', 'adaptive', 'fixed', 'external', 'rl'];
 const MIN_VIEW_ZOOM = 0.45;
 const MAX_VIEW_ZOOM = 2.8;
@@ -783,6 +784,7 @@ function makeVehicle(route, profile = null) {
     intersectionCarrySpeed: 0,
     intersectionCarryUntilProgress: 0,
     plannedNextLaneIndex: null,
+    stuckAtIntersectionTicks: 0,
   };
 }
 
@@ -1830,6 +1832,21 @@ function pickVehicleNextLane(vehicle, segment = getVehicleSegment(vehicle), entr
     0,
     0.98
   );
+  const nextLanes = context.nextRoad?.lanes ?? 1;
+  const shiftLimit = getIntersectionLaneShiftLimit(vehicle, vehicle.segmentIndex + 1, nextLanes);
+  const result = pickLaneWithSpace(
+    context.nextStartId,
+    context.nextEndId,
+    vehicle.id,
+    resolvedEntryProgress,
+    context.nextRoad,
+    vehicle.laneIndex ?? 0,
+    shiftLimit,
+    vehicle,
+    vehicle.segmentIndex + 1
+  );
+  if (result >= 0 || nextLanes <= 1) return result;
+  // All lanes within the normal shift limit are full — retry allowing any lane.
   return pickLaneWithSpace(
     context.nextStartId,
     context.nextEndId,
@@ -1837,7 +1854,7 @@ function pickVehicleNextLane(vehicle, segment = getVehicleSegment(vehicle), entr
     resolvedEntryProgress,
     context.nextRoad,
     vehicle.laneIndex ?? 0,
-    getIntersectionLaneShiftLimit(vehicle, vehicle.segmentIndex + 1, context.nextRoad?.lanes ?? 1),
+    Math.max(0, nextLanes - 1),
     vehicle,
     vehicle.segmentIndex + 1
   );
@@ -2004,7 +2021,13 @@ function canVehicleClearIntersection(vehicle, segment = getVehicleSegment(vehicl
   const minEntryProgress =
     getIntersectionReleaseDistance({ length: context.nextLength, road: context.nextRoad }, vehicle) /
     context.nextLength;
-  const pickedLane = resolveVehicleNextLane(vehicle, segment, minEntryProgress);
+  let pickedLane = resolveVehicleNextLane(vehicle, segment, minEntryProgress);
+  if (pickedLane < 0 && (vehicle.stuckAtIntersectionTicks ?? 0) >= STUCK_TICKS_RELAXED_ENTRY) {
+    pickedLane = pickLaneRelaxed(
+      context.nextStartId, context.nextEndId, vehicle.id,
+      minEntryProgress, context.nextRoad, vehicle
+    );
+  }
   if (pickedLane < 0) {
     return false;
   }
@@ -2017,7 +2040,10 @@ function canVehicleClearIntersection(vehicle, segment = getVehicleSegment(vehicl
     context.nextRoad,
     vehicle
   );
-  return entryMetrics.frontGap >= getIntersectionReleaseDistance({ length: context.nextLength }, vehicle);
+  const requiredGap = (vehicle.stuckAtIntersectionTicks ?? 0) >= STUCK_TICKS_RELAXED_ENTRY
+    ? getVehicleBodyClearance(vehicle, vehicle) + 2
+    : getIntersectionReleaseDistance({ length: context.nextLength }, vehicle);
+  return entryMetrics.frontGap >= requiredGap;
 }
 
 function buildIntersectionReservations(dt = FIXED_DT) {
@@ -2209,23 +2235,30 @@ function pickLaneWithSpace(
     if (preferred != null && maxLaneShift != null && Math.abs(routeLaneIndex - preferred) > maxLaneShift) {
       return -1;
     }
-    return hasLaneEntrySpace(
-      startId,
-      endId,
-      vehicleId,
-      entryProgress,
-      routeLaneIndex,
-      road,
-      candidateVehicle
-    )
-      ? routeLaneIndex
-      : -1;
+    if (
+      hasLaneEntrySpace(
+        startId,
+        endId,
+        vehicleId,
+        entryProgress,
+        routeLaneIndex,
+        road,
+        candidateVehicle
+      )
+    ) {
+      return routeLaneIndex;
+    }
+    // Preferred turn lane is full — fall through to try adjacent lanes
+    // so the vehicle doesn't freeze the entire lane behind it.
   }
   let bestLane = -1;
   let bestScore = Number.NEGATIVE_INFINITY;
 
   for (let i = 0; i < lanes; i += 1) {
     if (preferred != null && maxLaneShift != null && Math.abs(i - preferred) > maxLaneShift) {
+      continue;
+    }
+    if (routeLaneIndex != null && maxLaneShift != null && Math.abs(i - routeLaneIndex) > maxLaneShift) {
       continue;
     }
     const metrics = getLaneEntryMetrics(
@@ -2261,6 +2294,44 @@ function pickLaneWithSpace(
         Math.abs(i - preferred) < Math.abs(bestLane - preferred))
     ) {
       bestScore = score;
+      bestLane = i;
+    }
+  }
+  return bestLane;
+}
+
+function pickLaneRelaxed(startId, endId, vehicleId, entryProgress, road, candidateVehicle) {
+  const lanes = road?.lanes ?? 1;
+  const start = getIntersectionById(startId);
+  const end = getIntersectionById(endId);
+  const segmentLength = start && end ? Math.max(1, distance(start, end)) : 1;
+  let bestLane = -1;
+  let bestGap = -1;
+
+  for (let i = 0; i < lanes; i += 1) {
+    let minGap = segmentLength;
+    let blocked = false;
+    for (const other of state.vehicles) {
+      if (other.id === vehicleId) continue;
+      const otherSegment = getVehicleSegment(other);
+      if (!otherSegment) continue;
+      if (otherSegment.startId !== startId || otherSegment.endId !== endId) continue;
+      if (lanes > 1) {
+        const otherLane = Math.min(other.laneIndex ?? 0, Math.max(0, lanes - 1));
+        if (otherLane !== i) continue;
+      }
+      const centerDelta = (other.progress - entryProgress) * segmentLength;
+      const bodyDist = Math.abs(centerDelta) - getVehicleBodyClearance(other, candidateVehicle);
+      if (bodyDist < 1) {
+        blocked = true;
+        break;
+      }
+      if (centerDelta >= 0) {
+        minGap = Math.min(minGap, bodyDist);
+      }
+    }
+    if (!blocked && minGap > bestGap) {
+      bestGap = minGap;
       bestLane = i;
     }
   }
@@ -3058,8 +3129,92 @@ function updateSignals(dt, queueMetrics) {
   }
 }
 
+function tryMidSegmentLaneChanges(vehicles) {
+  const laneMap = new Map();
+  for (const vehicle of vehicles) {
+    const segment = getVehicleSegment(vehicle);
+    if (!segment) continue;
+    const roadLanes = segment.road?.lanes ?? 1;
+    if (roadLanes <= 1) continue;
+    const laneIndex = Math.min(vehicle.laneIndex ?? 0, Math.max(0, roadLanes - 1));
+    const key = `${segment.startId}->${segment.endId}:${laneIndex}`;
+    if (!laneMap.has(key)) laneMap.set(key, []);
+    laneMap.get(key).push({ vehicle, segment, laneIndex });
+  }
+
+  for (const laneEntries of laneMap.values()) {
+    if (laneEntries.length < 2) continue;
+    laneEntries.sort((a, b) => b.vehicle.progress - a.vehicle.progress);
+
+    const leader = laneEntries[0];
+    if (leader.vehicle.speed > 3) continue;
+    const leaderStopProgress = getStopLineProgress(leader.segment, leader.vehicle);
+    if (leader.vehicle.progress < leaderStopProgress - 0.05) continue;
+
+    const roadLanes = leader.segment.road?.lanes ?? 1;
+
+    for (let fi = 1; fi < laneEntries.length; fi += 1) {
+      const follower = laneEntries[fi];
+      if (follower.vehicle.speed > 5) continue;
+      const gap =
+        (leader.vehicle.progress - follower.vehicle.progress) * follower.segment.length -
+        getVehicleBodyClearance(leader.vehicle, follower.vehicle);
+      if (gap > getVehicleSafeGap(follower.vehicle) * 1.5) continue;
+
+      const candidateLanes = [];
+      for (let cl = 0; cl < roadLanes; cl += 1) {
+        if (cl !== follower.laneIndex) candidateLanes.push(cl);
+      }
+      candidateLanes.sort((a, b) => Math.abs(a - follower.laneIndex) - Math.abs(b - follower.laneIndex));
+
+      let bestLane = -1;
+      let bestGap = -1;
+      for (const targetLane of candidateLanes) {
+        const targetKey = `${follower.segment.startId}->${follower.segment.endId}:${targetLane}`;
+        const targetEntries = laneMap.get(targetKey) || [];
+        let laneBlocked = false;
+        let minForwardGap = follower.segment.length * (1 - follower.vehicle.progress);
+
+        for (const other of targetEntries) {
+          const dist = Math.abs(other.vehicle.progress - follower.vehicle.progress) * follower.segment.length;
+          if (dist < getVehicleSpacingDistance(other.vehicle, follower.vehicle)) {
+            laneBlocked = true;
+            break;
+          }
+          const fwdDelta = (other.vehicle.progress - follower.vehicle.progress) * follower.segment.length;
+          if (fwdDelta > 0) {
+            const bodyGap = fwdDelta - getVehicleBodyClearance(other.vehicle, follower.vehicle);
+            minForwardGap = Math.min(minForwardGap, bodyGap);
+          }
+        }
+        if (!laneBlocked && minForwardGap > getVehicleSafeGap(follower.vehicle)) {
+          if (minForwardGap > bestGap) {
+            bestGap = minForwardGap;
+            bestLane = targetLane;
+          }
+        }
+      }
+
+      if (bestLane >= 0) {
+        const oldKey = `${follower.segment.startId}->${follower.segment.endId}:${follower.laneIndex}`;
+        const newKey = `${follower.segment.startId}->${follower.segment.endId}:${bestLane}`;
+        const oldList = laneMap.get(oldKey);
+        if (oldList) {
+          const idx = oldList.indexOf(follower);
+          if (idx >= 0) oldList.splice(idx, 1);
+        }
+        follower.vehicle.laneIndex = bestLane;
+        follower.laneIndex = bestLane;
+        if (!laneMap.has(newKey)) laneMap.set(newKey, []);
+        laneMap.get(newKey).push(follower);
+      }
+    }
+  }
+}
+
 function updateVehicles(dt) {
   refreshPlannedNextLanes(state.vehicles);
+  tryMidSegmentLaneChanges(state.vehicles);
   const gapMap = buildLaneGapMap();
   const intersectionReservations = buildIntersectionReservations(dt);
   const survivors = [];
@@ -3235,8 +3390,12 @@ function updateVehicles(dt) {
           0,
           0.98
         );
-        const pickedLane = resolveVehicleNextLane(vehicle, segment, projectedProgress);
+        let pickedLane = resolveVehicleNextLane(vehicle, segment, projectedProgress);
+        if (pickedLane < 0 && (vehicle.stuckAtIntersectionTicks ?? 0) >= STUCK_TICKS_RELAXED_ENTRY) {
+          pickedLane = pickLaneRelaxed(nextStartId, nextEndId, vehicle.id, projectedProgress, nextRoad, vehicle);
+        }
         if (pickedLane < 0) {
+          vehicle.stuckAtIntersectionTicks = (vehicle.stuckAtIntersectionTicks ?? 0) + 1;
           const holdProgress = clamp(
             Math.max(tickStartProgress, getStopLineProgress(segment, vehicle)),
             0,
@@ -3248,6 +3407,7 @@ function updateVehicles(dt) {
           break;
         }
         vehicle.laneIndex = pickedLane;
+        vehicle.stuckAtIntersectionTicks = 0;
       }
 
       // Reserve this intersection for this tick so only one vehicle crosses at a time.
