@@ -1,4 +1,4 @@
-﻿<!doctype html>
+<!doctype html>
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
@@ -70,7 +70,8 @@
             Future AI hook:
             <code>setTrafficLightAgent(fn)</code>
             where <code>fn(snapshot)</code> returns decisions per intersection using
-            <code>approach: N/E/S/W</code> (or legacy <code>EW/NS</code>).
+            <code>approach: N/E/S/W</code> (or legacy <code>EW/NS</code>). Trained RL models can be exported from
+            <code>train.html</code> and selected in the inspector as <code>RL Agent (trained)</code>.
           </p>
         </section>
       </aside>
@@ -79,7 +80,12 @@
         <canvas id="sim-canvas" width="1200" height="760"></canvas>
       </main>
     </div>
-
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs/dist/tf.min.js"></script>
     <script type="module" src="app.js"></script>
+    <script type="module">
+      import { attachRlRuntime } from './rl-agent.js';
+
+      await attachRlRuntime(window, { storageKey: 'main', eligibleMode: 'rl' });
+    </script>
   </body>
 </html>

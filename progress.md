@@ -56,6 +56,12 @@ Original prompt: Build a traffic simulation, that the user can add intersections
   - When a neighbor is green for traffic toward us, we add a coordination bonus to the approach that receives from that neighbor.
   - Applied to both built-in Adaptive and External agent (via `coordination_bonus` in snapshot).
   - Only active when `state.currentScenarioId` is `ring` or `linear` (set by `buildScenario`).
+- Added in-browser RL training/inference flow:
+  - New `rl-agent.js` module with fixed-width state encoding, masked action decoding, PPO-style update loop, reward function, and IndexedDB save/load.
+  - Added `signal.mode = rl` support with a dedicated RL agent hook and adaptive fallback when no trained model is loaded.
+  - Added reward APIs to `app.js`: `getRewardMetrics()` and `resetPhaseChangeCounter()`.
+  - Added `train.html` for browser-based RL training, logging, reward charting, and exporting the trained model to the main app slot.
+  - Added RL runtime loading to `index.html` and `backtest.html`, plus RL as a 4th comparison mode in backtest.
 
 ## Validation
 - Installed local Node dependencies in workspace (`playwright`) and Playwright browser binaries under `.playwright-browsers`.
@@ -99,8 +105,16 @@ Original prompt: Build a traffic simulation, that the user can add intersections
   - Run output: `output/web-game-no-uturn-check` (`8` captures, `300` frames each).
   - State scan across captures reported `NO_REVERSE_EDGE_TRANSITIONS_DETECTED` (no `A->B` then `B->A` transitions for the same vehicle).
   - No Playwright error file was produced for the run.
+- RL smoke validation:
+  - Installed local Chromium with `npx playwright install chromium` after the Playwright client reported missing browser binaries.
+  - Smoke runs saved to `output/rl-index-smoke`, `output/rl-backtest-smoke`, and `output/rl-train-smoke`.
+  - Browser verification confirmed:
+    - `train.html` renders controls for episodes, update cadence, scenario selection, reward chart, and export actions.
+    - A short 1-episode / 30-second training run completed in-browser and logged reward/loss output.
+    - Exporting the trained model removed the previous \"missing RL model\" fallback warning on fresh `index.html` / `backtest.html` loads.
 
 ## TODO
 - Optional: add persistence (save/load network JSON) if needed for larger experiments.
 - Optional: expose richer per-lane congestion metrics (wait time, throughput) for AI training signals.
+- Optional: improve the PPO implementation with minibatches / GAE tuning if training quality becomes unstable.
 - Optional: remove `C:\Users\jundee\.codex\skills\develop-web-game\node_modules` junction if no longer needed.

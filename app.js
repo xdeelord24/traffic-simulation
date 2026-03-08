@@ -75,9 +75,11 @@ const state = {
   lastOverlapPairs: 0,
   collisionWarningTicks: 0,
   trafficLightAgent: null,
+  rlTrafficLightAgent: null,
   pendingAgentDecision: false,
   lastAgentDecisionAt: 0,
   vehiclesCompleted: 0,
+  phaseChangeCount: 0,
   backtestSeed: null,
   currentScenarioId: null,
 };
@@ -322,6 +324,7 @@ function clearMap() {
   state.lastOverlapPairs = 0;
   state.collisionWarningTicks = 0;
   state.vehiclesCompleted = 0;
+  state.phaseChangeCount = 0;
   state.currentScenarioId = null;
   renderWeightTable();
   renderInspector();
@@ -564,7 +567,8 @@ function renderInspector() {
           Signal mode
           <select data-inspector="signalMode">
             <option value="none" ${node.signal.mode === 'none' ? 'selected' : ''}>No traffic light (free flow)</option>
-              <option value="adaptive" ${node.signal.mode === 'adaptive' ? 'selected' : ''}>Adaptive AI (pressure)</option>
+            <option value="adaptive" ${node.signal.mode === 'adaptive' ? 'selected' : ''}>Adaptive AI (pressure)</option>
+            <option value="rl" ${node.signal.mode === 'rl' ? 'selected' : ''}>RL Agent (trained)</option>
             <option value="fixed" ${node.signal.mode === 'fixed' ? 'selected' : ''}>Static (fixed cycle, typical)</option>
             <option value="external" ${node.signal.mode === 'external' ? 'selected' : ''}>External AI controlled</option>
           </select>
@@ -655,9 +659,13 @@ function togglePhase(intersection, nextPhase = null, queue = null) {
     }
   }
 
+  const previousPhase = intersection.signal.phase;
   intersection.signal.phase = resolved;
   intersection.signal.elapsed = 0;
   intersection.signal.waitAges[resolved] = 0;
+  if (resolved !== previousPhase) {
+    state.phaseChangeCount += 1;
+  }
 }
 
 function handleCanvasPointerDown(event) {
@@ -1400,7 +1408,14 @@ function updateWaitAges(signal, queue, flow, availableApproaches, dt) {
 }
 
 function maybeAskTrafficAgent() {
-  if (typeof state.trafficLightAgent !== 'function') {
+  const needsExternalAgent =
+    typeof state.trafficLightAgent === 'function' &&
+    state.intersections.some((node) => node.signal.mode === 'external');
+  const needsRlAgent =
+    typeof state.rlTrafficLightAgent === 'function' &&
+    state.intersections.some((node) => node.signal.mode === 'rl');
+
+  if (!needsExternalAgent && !needsRlAgent) {
     return;
   }
 
@@ -1416,10 +1431,23 @@ function maybeAskTrafficAgent() {
   state.pendingAgentDecision = true;
 
   const snapshot = buildTrafficSnapshot();
-  Promise.resolve(state.trafficLightAgent(snapshot))
-    .then((decisions) => {
-      applyTrafficLightDecisions(decisions);
-    })
+  const agentCalls = [];
+  if (needsExternalAgent) {
+    agentCalls.push(
+      Promise.resolve(state.trafficLightAgent(snapshot)).then((decisions) => {
+        applyTrafficLightDecisions(decisions, 'external');
+      })
+    );
+  }
+  if (needsRlAgent) {
+    agentCalls.push(
+      Promise.resolve(state.rlTrafficLightAgent(snapshot)).then((decisions) => {
+        applyTrafficLightDecisions(decisions, 'rl');
+      })
+    );
+  }
+
+  Promise.all(agentCalls)
     .catch((error) => {
       console.error('Traffic agent error:', error);
     })
@@ -1428,7 +1456,7 @@ function maybeAskTrafficAgent() {
     });
 }
 
-function applyTrafficLightDecisions(decisions) {
+function applyTrafficLightDecisions(decisions, requiredMode = null) {
   if (!decisions) return;
 
   if (Array.isArray(decisions)) {
@@ -1436,6 +1464,7 @@ function applyTrafficLightDecisions(decisions) {
       if (!entry || !entry.id) continue;
       const node = getIntersectionById(entry.id);
       if (!node) continue;
+      if (requiredMode && node.signal.mode !== requiredMode) continue;
       const queue = state.lastQueueMetrics.get(node.id) || makeEmptyQueue();
       if (typeof entry.phase === 'string' || typeof entry.approach === 'string') {
         togglePhase(node, entry.approach || entry.phase, queue);
@@ -1454,6 +1483,7 @@ function applyTrafficLightDecisions(decisions) {
     for (const [id, phase] of Object.entries(decisions.phases)) {
       const node = getIntersectionById(id);
       if (!node) continue;
+      if (requiredMode && node.signal.mode !== requiredMode) continue;
       if (typeof phase === 'string') {
         const queue = state.lastQueueMetrics.get(node.id) || makeEmptyQueue();
         togglePhase(node, phase, queue);
@@ -1465,6 +1495,7 @@ function applyTrafficLightDecisions(decisions) {
     for (const id of decisions.switch) {
       const node = getIntersectionById(id);
       if (!node) continue;
+      if (requiredMode && node.signal.mode !== requiredMode) continue;
       const queue = state.lastQueueMetrics.get(node.id) || makeEmptyQueue();
       togglePhase(node, null, queue);
     }
@@ -1560,7 +1591,7 @@ function updateSignals(dt, queueMetrics) {
       continue;
     }
 
-    if (signal.mode === 'adaptive') {
+    if (signal.mode === 'adaptive' || (signal.mode === 'rl' && typeof state.rlTrafficLightAgent !== 'function')) {
       if (signal.elapsed >= signal.maxGreen) {
         const forced = starvationForced ? starvationApproach : alternateDemand ? bestApproach : null;
         togglePhase(node, forced, queue);
@@ -1582,8 +1613,8 @@ function updateSignals(dt, queueMetrics) {
       continue;
     }
 
-    if (signal.mode === 'external' && signal.elapsed >= signal.maxGreen * 2) {
-      // Safety fallback when an external agent is silent.
+    if ((signal.mode === 'external' || signal.mode === 'rl') && signal.elapsed >= signal.maxGreen * 2) {
+      // Safety fallback when an external or RL agent is silent.
       const fallback = starvationForced ? starvationApproach : alternateDemand ? bestApproach : null;
       togglePhase(node, fallback, queue);
     }
@@ -2356,7 +2387,7 @@ function attachUiEvents() {
       }
       if (key === 'signalMode') {
         const nextMode = String(event.target.value || 'none');
-        node.signal.mode = ['none', 'adaptive', 'fixed', 'external'].includes(nextMode)
+        node.signal.mode = ['none', 'adaptive', 'fixed', 'external', 'rl'].includes(nextMode)
           ? nextMode
           : 'none';
         ensureSignalWaitAges(node.signal);
@@ -2498,10 +2529,29 @@ window.applyTrafficLightDecisions = (decisions) => applyTrafficLightDecisions(de
 window.setTrafficLightAgent = (agentFn) => {
   state.trafficLightAgent = typeof agentFn === 'function' ? agentFn : null;
 };
+window.setRlTrafficLightAgent = (agentFn) => {
+  state.rlTrafficLightAgent = typeof agentFn === 'function' ? agentFn : null;
+};
 window.stepSimulation = stepSimulation;
 window.clearMap = clearMap;
 window.buildSampleGrid = buildSampleGrid;
 window.buildScenario = buildScenario;
+window.getRewardMetrics = () => {
+  let totalQueue = 0;
+  for (const q of state.lastQueueMetrics.values()) {
+    totalQueue += (q.N || 0) + (q.E || 0) + (q.S || 0) + (q.W || 0);
+  }
+  return {
+    vehiclesCompleted: state.vehiclesCompleted,
+    totalQueue,
+    phaseChanges: state.phaseChangeCount,
+    vehiclesActive: state.vehicles.length,
+    time_s: state.simulationTime,
+  };
+};
+window.resetPhaseChangeCounter = () => {
+  state.phaseChangeCount = 0;
+};
 window.getBacktestMetrics = () => {
   let totalQueue = 0;
   for (const q of state.lastQueueMetrics.values()) {
@@ -2528,7 +2578,7 @@ window.clearBacktestSeed = () => {
 };
 window.setAllSignalModes = (mode) => {
   for (const node of state.intersections) {
-    node.signal.mode = ['none', 'adaptive', 'fixed', 'external'].includes(mode) ? mode : 'adaptive';
+    node.signal.mode = ['none', 'adaptive', 'fixed', 'external', 'rl'].includes(mode) ? mode : 'adaptive';
     if (node.signal.mode === 'none') node.signal.elapsed = 0;
   }
 };

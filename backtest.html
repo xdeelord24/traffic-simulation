@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Traffic Backtest: Adaptive vs External AI</title>
+    <title>Traffic Backtest: Adaptive vs External vs RL</title>
     <link rel="stylesheet" href="styles.css" />
     <style>
       .backtest-panel {
@@ -27,6 +27,7 @@
       }
       .backtest-result.adaptive { background: rgba(42, 157, 143, 0.15); }
       .backtest-result.external { background: rgba(251, 133, 0, 0.15); }
+      .backtest-result.rl { background: rgba(173, 127, 255, 0.15); }
       .backtest-result.static { background: rgba(107, 128, 149, 0.2); }
       .backtest-result h3 { margin-top: 0; }
       .backtest-result pre { margin: 0.5rem 0; font-size: 12px; }
@@ -39,6 +40,7 @@
       }
       .backtest-winner.adaptive { background: rgba(42, 157, 143, 0.3); }
       .backtest-winner.external { background: rgba(251, 133, 0, 0.3); }
+      .backtest-winner.rl { background: rgba(173, 127, 255, 0.3); }
       .backtest-winner.tie { background: rgba(107, 128, 149, 0.3); }
       #backtest-log { font-size: 11px; max-height: 180px; overflow-y: auto; }
       .scenario-table { width: 100%; font-size: 12px; margin-top: 1rem; border-collapse: collapse; }
@@ -46,6 +48,7 @@
       .scenario-table th { background: rgba(15, 31, 46, 0.8); }
       .scenario-table .adaptive-wins { color: #2a9d8f; }
       .scenario-table .external-wins { color: #fb8500; }
+      .scenario-table .rl-wins { color: #ad7fff; }
       .scenario-table .static-wins { color: #6f8095; }
       .summary-row { font-weight: bold; background: rgba(15, 31, 46, 0.5); }
     </style>
@@ -55,12 +58,12 @@
       <aside class="control-panel">
         <header class="panel-header">
           <h1>Traffic Backtest</h1>
-          <p>Compare Adaptive AI vs External AI at 120 vehicles/min spawn rate.</p>
+          <p>Compare Adaptive AI, External AI, and RL control at 120 vehicles/min spawn rate.</p>
         </header>
 
         <section class="group backtest-panel">
           <h2>Backtest</h2>
-          <p class="tiny">Runs 3 min per scenario per mode at 120/min spawn, 3 trials averaged per scenario. Tests 8 road designs. Compares Adaptive AI, External AI (pressure-based), and Static (fixed 30s cycle, typical real-life). Uses seeded RNG for reproducible results.</p>
+          <p class="tiny">Runs 3 min per scenario per mode at 120/min spawn, 3 trials averaged per scenario. Tests 8 road designs. Compares Adaptive AI, External AI (pressure-based), RL Agent (trained or heuristic fallback), and Static (fixed 30s cycle, typical real-life). Uses seeded RNG for reproducible results.</p>
           <div class="button-row">
             <button id="run-backtest">Run All Scenarios</button>
           </div>
@@ -102,8 +105,12 @@
       </main>
     </div>
 
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs/dist/tf.min.js"></script>
     <script type="module" src="app.js"></script>
     <script type="module">
+      import { attachRlRuntime } from './rl-agent.js';
+
+      const rlRuntime = await attachRlRuntime(window, { storageKey: 'main', eligibleMode: 'rl' });
       const BACKTEST_DURATION_S = 180;
       const BACKTEST_TRIALS = 3;
 
@@ -272,36 +279,42 @@
         document.getElementById('backtest-results').style.display = 'none';
 
         log(`Starting multi-scenario backtest @ 120/min, 3 min per run, ${BACKTEST_TRIALS} trials per scenario...`);
+        log(rlRuntime.loaded ? 'RL model loaded from IndexedDB.' : 'RL model missing; using heuristic fallback.');
         const results = [];
 
         for (const scenario of SCENARIOS) {
           log(`\n--- ${scenario.name} ---`);
-          let adaptiveSum = 0, externalSum = 0, staticSum = 0;
+          let adaptiveSum = 0, externalSum = 0, rlSum = 0, staticSum = 0;
 
           for (let t = 0; t < BACKTEST_TRIALS; t++) {
             const seed = scenarioSeed(scenario.id, t);
             log(`  Trial ${t + 1}/${BACKTEST_TRIALS}...`);
             const adaptive = await runOneMode('adaptive', 'Adaptive', scenario.id, seed);
             const external = await runOneMode('external', 'External', scenario.id, seed);
+            const rl = await runOneMode('rl', 'RL', scenario.id, seed);
             const static_ = await runOneMode('fixed', 'Static', scenario.id, seed);
             adaptiveSum += adaptive.vehiclesCompleted;
             externalSum += external.vehiclesCompleted;
+            rlSum += rl.vehiclesCompleted;
             staticSum += static_.vehiclesCompleted;
           }
 
           const adaptiveAvg = Math.round(adaptiveSum / BACKTEST_TRIALS);
           const externalAvg = Math.round(externalSum / BACKTEST_TRIALS);
+          const rlAvg = Math.round(rlSum / BACKTEST_TRIALS);
           const staticAvg = Math.round(staticSum / BACKTEST_TRIALS);
-          log(`  Avg: Adaptive ${adaptiveAvg}, External ${externalAvg}, Static ${staticAvg}`);
+          log(`  Avg: Adaptive ${adaptiveAvg}, External ${externalAvg}, RL ${rlAvg}, Static ${staticAvg}`);
 
-          const best = Math.max(adaptiveAvg, externalAvg, staticAvg);
+          const best = Math.max(adaptiveAvg, externalAvg, rlAvg, staticAvg);
           const winner = adaptiveAvg === best ? 'adaptive'
             : externalAvg === best ? 'external'
+            : rlAvg === best ? 'rl'
             : staticAvg === best ? 'static' : 'tie';
           results.push({
             scenario: scenario.name,
             adaptive: { vehiclesCompleted: adaptiveAvg },
             external: { vehiclesCompleted: externalAvg },
+            rl: { vehiclesCompleted: rlAvg },
             static: { vehiclesCompleted: staticAvg },
             winner,
           });
@@ -311,29 +324,57 @@
 
         log('\nDone. Building summary...');
 
-        let adaptiveWins = 0, externalWins = 0, staticWins = 0, ties = 0;
-        let adaptiveTotal = 0, externalTotal = 0, staticTotal = 0;
+        let adaptiveWins = 0, externalWins = 0, rlWins = 0, staticWins = 0, ties = 0;
+        let adaptiveTotal = 0, externalTotal = 0, rlTotal = 0, staticTotal = 0;
 
         const rows = results.map((r) => {
           if (r.winner === 'adaptive') adaptiveWins++;
           else if (r.winner === 'external') externalWins++;
+          else if (r.winner === 'rl') rlWins++;
           else if (r.winner === 'static') staticWins++;
           else ties++;
           adaptiveTotal += r.adaptive.vehiclesCompleted;
           externalTotal += r.external.vehiclesCompleted;
+          rlTotal += r.rl.vehiclesCompleted;
           staticTotal += r.static.vehiclesCompleted;
 
-          const winClass = r.winner === 'adaptive' ? 'adaptive-wins' : r.winner === 'external' ? 'external-wins' : r.winner === 'static' ? 'static-wins' : '';
-          const winText = r.winner === 'adaptive' ? 'Adaptive' : r.winner === 'external' ? 'External' : r.winner === 'static' ? 'Static' : 'Tie';
-          return `<tr><td>${r.scenario}</td><td>${r.adaptive.vehiclesCompleted}</td><td>${r.external.vehiclesCompleted}</td><td>${r.static.vehiclesCompleted}</td><td class="${winClass}">${winText}</td></tr>`;
+          const winClass = r.winner === 'adaptive'
+            ? 'adaptive-wins'
+            : r.winner === 'external'
+              ? 'external-wins'
+              : r.winner === 'rl'
+                ? 'rl-wins'
+                : r.winner === 'static'
+                  ? 'static-wins'
+                  : '';
+          const winText = r.winner === 'adaptive'
+            ? 'Adaptive'
+            : r.winner === 'external'
+              ? 'External'
+              : r.winner === 'rl'
+                ? 'RL'
+                : r.winner === 'static'
+                  ? 'Static'
+                  : 'Tie';
+          return `<tr><td>${r.scenario}</td><td>${r.adaptive.vehiclesCompleted}</td><td>${r.external.vehiclesCompleted}</td><td>${r.rl.vehiclesCompleted}</td><td>${r.static.vehiclesCompleted}</td><td class="${winClass}">${winText}</td></tr>`;
         }).join('');
 
-        const bestTotal = Math.max(adaptiveTotal, externalTotal, staticTotal);
-        const overallWinner = adaptiveTotal === bestTotal ? 'adaptive' : externalTotal === bestTotal ? 'external' : staticTotal === bestTotal ? 'static' : 'tie';
+        const bestTotal = Math.max(adaptiveTotal, externalTotal, rlTotal, staticTotal);
+        const overallWinner = adaptiveTotal === bestTotal
+          ? 'adaptive'
+          : externalTotal === bestTotal
+            ? 'external'
+            : rlTotal === bestTotal
+              ? 'rl'
+              : staticTotal === bestTotal
+                ? 'static'
+                : 'tie';
         const overallText = overallWinner === 'adaptive'
           ? `Adaptive AI wins overall (${adaptiveTotal} total)`
           : overallWinner === 'external'
             ? `External AI wins overall (${externalTotal} total)`
+            : overallWinner === 'rl'
+              ? `RL Agent wins overall (${rlTotal} total)`
             : overallWinner === 'static'
               ? `Static (fixed) wins overall (${staticTotal} total)`
               : 'Tie overall';
@@ -343,12 +384,12 @@
         resultsDiv.innerHTML = `
           <div class="backtest-result" style="grid-column: 1 / -1;">
             <h3>Summary</h3>
-            <p>Adaptive won ${adaptiveWins}, External won ${externalWins}, Static won ${staticWins}, ${ties} ties.</p>
+            <p>Adaptive won ${adaptiveWins}, External won ${externalWins}, RL won ${rlWins}, Static won ${staticWins}, ${ties} ties.</p>
             <p><strong>${overallText}</strong></p>
             <table class="scenario-table">
-              <thead><tr><th>Scenario</th><th>Adaptive</th><th>External</th><th>Static (30s)</th><th>Winner</th></tr></thead>
+              <thead><tr><th>Scenario</th><th>Adaptive</th><th>External</th><th>RL</th><th>Static (30s)</th><th>Winner</th></tr></thead>
               <tbody>${rows}</tbody>
-              <tr class="summary-row"><td>Total</td><td>${adaptiveTotal}</td><td>${externalTotal}</td><td>${staticTotal}</td><td>${overallWinner === 'adaptive' ? 'Adaptive' : overallWinner === 'external' ? 'External' : overallWinner === 'static' ? 'Static' : 'Tie'}</td></tr>
+              <tr class="summary-row"><td>Total</td><td>${adaptiveTotal}</td><td>${externalTotal}</td><td>${rlTotal}</td><td>${staticTotal}</td><td>${overallWinner === 'adaptive' ? 'Adaptive' : overallWinner === 'external' ? 'External' : overallWinner === 'rl' ? 'RL' : overallWinner === 'static' ? 'Static' : 'Tie'}</td></tr>
             </table>
           </div>
         `;

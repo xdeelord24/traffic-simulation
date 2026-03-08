@@ -1,0 +1,373 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Traffic RL Trainer</title>
+    <link rel="stylesheet" href="styles.css" />
+    <style>
+      .trainer-panel {
+        margin: 1rem 0;
+        padding: 1rem;
+        background: rgba(15, 31, 46, 0.6);
+        border-radius: 8px;
+        border: 1px solid rgba(107, 128, 149, 0.4);
+      }
+      .trainer-panel h2 { margin-top: 0; }
+      .scenario-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 0.4rem 0.8rem;
+        margin-top: 0.6rem;
+      }
+      .scenario-grid label {
+        display: flex;
+        align-items: center;
+        gap: 0.45rem;
+      }
+      #reward-chart {
+        width: 100%;
+        height: 180px;
+        border-radius: 8px;
+        background: rgba(8, 18, 29, 0.8);
+        border: 1px solid rgba(107, 128, 149, 0.35);
+      }
+      #train-log {
+        font-size: 11px;
+        max-height: 220px;
+        overflow-y: auto;
+      }
+      .status-chip {
+        display: inline-block;
+        padding: 0.2rem 0.5rem;
+        border-radius: 999px;
+        background: rgba(42, 157, 143, 0.18);
+        border: 1px solid rgba(42, 157, 143, 0.45);
+        font-size: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app-shell">
+      <aside class="control-panel">
+        <header class="panel-header">
+          <h1>Traffic RL Trainer</h1>
+          <p>Train an in-browser RL traffic-light policy and export it to the main simulation.</p>
+        </header>
+
+        <section class="group trainer-panel">
+          <h2>Training</h2>
+          <p class="tiny">Runs PPO-style updates in the browser with a shared policy across topologies.</p>
+          <div class="inline">
+            <label>
+              Episodes
+              <input id="episodes" type="number" min="1" step="1" value="40" />
+            </label>
+            <label>
+              Update every
+              <input id="update-every" type="number" min="1" step="1" value="4" />
+            </label>
+          </div>
+          <div class="inline">
+            <label>
+              Episode seconds
+              <input id="episode-seconds" type="number" min="30" step="30" value="180" />
+            </label>
+            <label>
+              UI refresh every steps
+              <input id="refresh-every" type="number" min="1" step="1" value="10" />
+            </label>
+          </div>
+          <div class="inline">
+            <label>
+              Spawn rate / min
+              <input id="train-spawn-rate" type="number" min="0" max="120" step="1" value="120" />
+            </label>
+          </div>
+          <div class="scenario-grid" id="scenario-grid"></div>
+          <div class="button-row" style="margin-top: 0.8rem;">
+            <button id="start-training">Start Training</button>
+            <button id="stop-training">Stop</button>
+            <button id="save-model">Save Trainer Model</button>
+            <button id="load-model">Load Trainer Model</button>
+            <button id="export-model">Export To Main App</button>
+          </div>
+          <p class="tiny"><span class="status-chip" id="model-status">Fresh model</span></p>
+        </section>
+
+        <section class="group trainer-panel">
+          <h2>Reward</h2>
+          <canvas id="reward-chart" width="360" height="180"></canvas>
+        </section>
+
+        <section class="group trainer-panel">
+          <h2>Log</h2>
+          <pre id="train-log"></pre>
+        </section>
+
+        <section class="group">
+          <h2>Stats</h2>
+          <pre id="stats" class="stats"></pre>
+        </section>
+      </aside>
+
+      <main id="stage-wrap" aria-label="Traffic simulation stage">
+        <canvas id="sim-canvas" width="1200" height="760"></canvas>
+      </main>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs/dist/tf.min.js"></script>
+    <script type="module" src="app.js"></script>
+    <script type="module">
+      import { RLAgent, computeReward } from './rl-agent.js';
+
+      const TRAINER_STORAGE_KEY = 'trainer';
+      const MAIN_STORAGE_KEY = 'main';
+      const SCENARIOS = [
+        { id: 'grid3x3', name: '3×3 Grid' },
+        { id: 'grid4x4', name: '4×4 Grid' },
+        { id: 'linear', name: 'Linear (5 nodes)' },
+        { id: 'cross', name: 'Cross (5-way)' },
+        { id: 'star', name: 'Star (4 spokes)' },
+        { id: 'diamond', name: 'Diamond' },
+        { id: 'bottleneck', name: 'Bottleneck' },
+        { id: 'ring', name: 'Ring (6 nodes)' },
+      ];
+
+      const agent = new RLAgent();
+      const rewardHistory = [];
+      let training = false;
+
+      const ui = {
+        episodes: document.getElementById('episodes'),
+        updateEvery: document.getElementById('update-every'),
+        episodeSeconds: document.getElementById('episode-seconds'),
+        refreshEvery: document.getElementById('refresh-every'),
+        spawnRate: document.getElementById('train-spawn-rate'),
+        start: document.getElementById('start-training'),
+        stop: document.getElementById('stop-training'),
+        save: document.getElementById('save-model'),
+        load: document.getElementById('load-model'),
+        export: document.getElementById('export-model'),
+        status: document.getElementById('model-status'),
+        chart: document.getElementById('reward-chart'),
+        log: document.getElementById('train-log'),
+        scenarioGrid: document.getElementById('scenario-grid'),
+      };
+
+      function log(message) {
+        ui.log.textContent += `${message}\n`;
+        ui.log.scrollTop = ui.log.scrollHeight;
+      }
+
+      function setStatus(text) {
+        ui.status.textContent = text;
+      }
+
+      function renderScenarioGrid() {
+        ui.scenarioGrid.innerHTML = [
+          '<label><input type="checkbox" data-scenario="all" checked /> All scenarios</label>',
+          ...SCENARIOS.map(
+            (scenario) =>
+              `<label><input type="checkbox" data-scenario="${scenario.id}" checked /> ${scenario.name}</label>`
+          ),
+        ].join('');
+      }
+
+      function selectedScenarioIds() {
+        const all = ui.scenarioGrid.querySelector('input[data-scenario="all"]');
+        if (all?.checked) {
+          return SCENARIOS.map((scenario) => scenario.id);
+        }
+        const checked = Array.from(ui.scenarioGrid.querySelectorAll('input[data-scenario]'))
+          .filter((input) => input.dataset.scenario !== 'all' && input.checked)
+          .map((input) => input.dataset.scenario);
+        return checked.length ? checked : SCENARIOS.map((scenario) => scenario.id);
+      }
+
+      function drawRewardChart() {
+        const ctx = ui.chart.getContext('2d');
+        if (!ctx) return;
+        ctx.clearRect(0, 0, ui.chart.width, ui.chart.height);
+        ctx.fillStyle = '#08121d';
+        ctx.fillRect(0, 0, ui.chart.width, ui.chart.height);
+
+        if (rewardHistory.length === 0) return;
+        const min = Math.min(...rewardHistory);
+        const max = Math.max(...rewardHistory);
+        const range = Math.max(1, max - min);
+
+        ctx.strokeStyle = 'rgba(173, 127, 255, 0.95)';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        rewardHistory.forEach((reward, index) => {
+          const x = (index / Math.max(1, rewardHistory.length - 1)) * (ui.chart.width - 24) + 12;
+          const y =
+            ui.chart.height -
+            12 -
+            ((reward - min) / range) * (ui.chart.height - 24);
+          if (index === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        });
+        ctx.stroke();
+
+        ctx.fillStyle = '#d7e3ee';
+        ctx.font = '12px sans-serif';
+        ctx.fillText(`Last reward: ${rewardHistory[rewardHistory.length - 1].toFixed(2)}`, 12, 18);
+      }
+
+      async function runEpisode(episodeIndex) {
+        const chosen = selectedScenarioIds();
+        const scenarioId = chosen[episodeIndex % chosen.length];
+        const episodeSeconds = Math.max(30, Number(ui.episodeSeconds.value) || 180);
+        const refreshEvery = Math.max(1, Number(ui.refreshEvery.value) || 10);
+        const spawnRate = Math.max(0, Number(ui.spawnRate.value) || 120);
+        const seed = (((episodeIndex + 1) * 0x9e3779b9) ^ scenarioId.length) >>> 0 || 1;
+
+        window.buildScenario(scenarioId);
+        window.setBacktestSeed(seed);
+        window.setSpawnRate(spawnRate);
+        window.setAllSignalModes('rl');
+        window.setTrafficLightAgent(null);
+        window.setRlTrafficLightAgent(null);
+        window.resetPhaseChangeCounter();
+
+        agent.beginEpisode();
+        let prevMetrics = window.getRewardMetrics();
+        let totalReward = 0;
+
+        for (let step = 0; step < episodeSeconds; step += 1) {
+          const snapshot = window.getTrafficSnapshot();
+          const { decisions, transition } = agent.act(snapshot, {
+            eligibleMode: 'rl',
+            deterministic: false,
+          });
+          window.applyTrafficLightDecisions(decisions);
+          window.stepSimulation(1);
+
+          const currMetrics = window.getRewardMetrics();
+          const phaseChangeDelta = currMetrics.phaseChanges - prevMetrics.phaseChanges;
+          const reward = computeReward(prevMetrics, currMetrics, phaseChangeDelta);
+          agent.addTransition(transition, reward, step === episodeSeconds - 1);
+          prevMetrics = currMetrics;
+          totalReward += reward;
+
+          if ((step + 1) % refreshEvery === 0) {
+            await new Promise((resolve) => requestAnimationFrame(resolve));
+          }
+        }
+
+        agent.finishEpisode(0);
+        window.clearBacktestSeed();
+        return {
+          scenarioId,
+          reward: totalReward,
+          vehiclesCompleted: prevMetrics.vehiclesCompleted,
+          queue: prevMetrics.totalQueue,
+        };
+      }
+
+      async function train() {
+        const totalEpisodes = Math.max(1, Number(ui.episodes.value) || 1);
+        const updateEvery = Math.max(1, Number(ui.updateEvery.value) || 4);
+        training = true;
+        ui.start.disabled = true;
+        setStatus('Training in progress');
+        log(`Starting training for ${totalEpisodes} episode(s).`);
+
+        for (let episode = 0; episode < totalEpisodes && training; episode += 1) {
+          const result = await runEpisode(episode);
+          rewardHistory.push(result.reward);
+          drawRewardChart();
+
+          let lossText = 'rollout buffered';
+          if ((episode + 1) % updateEvery === 0) {
+            const metrics = await agent.update();
+            lossText = `loss=${metrics.loss.toFixed(3)} policy=${metrics.policyLoss.toFixed(3)} value=${metrics.valueLoss.toFixed(3)}`;
+          }
+
+          log(
+            `Episode ${episode + 1}/${totalEpisodes} | scenario=${result.scenarioId} | reward=${result.reward.toFixed(2)} | completed=${result.vehiclesCompleted} | queue=${result.queue.toFixed(1)} | ${lossText}`
+          );
+          setStatus(`Episode ${episode + 1}/${totalEpisodes}`);
+          await new Promise((resolve) => requestAnimationFrame(resolve));
+        }
+
+        if (agent.rollout.length) {
+          const metrics = await agent.update();
+          log(`Final update | loss=${metrics.loss.toFixed(3)} policy=${metrics.policyLoss.toFixed(3)} value=${metrics.valueLoss.toFixed(3)}`);
+        }
+
+        training = false;
+        ui.start.disabled = false;
+        setStatus('Training idle');
+      }
+
+      ui.start.addEventListener('click', async () => {
+        if (training) return;
+        try {
+          await train();
+        } catch (error) {
+          console.error(error);
+          log(`Training error: ${error.message}`);
+          training = false;
+          ui.start.disabled = false;
+          setStatus('Training failed');
+        }
+      });
+
+      ui.stop.addEventListener('click', () => {
+        training = false;
+        setStatus('Stopping after current episode');
+      });
+
+      ui.save.addEventListener('click', async () => {
+        await agent.save(TRAINER_STORAGE_KEY);
+        setStatus('Trainer model saved');
+        log('Saved trainer model to IndexedDB.');
+      });
+
+      ui.load.addEventListener('click', async () => {
+        try {
+          await agent.load(TRAINER_STORAGE_KEY);
+          setStatus('Trainer model loaded');
+          log('Loaded trainer model from IndexedDB.');
+        } catch (error) {
+          log(`Load failed: ${error.message}`);
+          setStatus('No saved trainer model');
+        }
+      });
+
+      ui.export.addEventListener('click', async () => {
+        await agent.save(MAIN_STORAGE_KEY);
+        setStatus('Exported to main app');
+        log('Exported model to the main-app IndexedDB slot.');
+      });
+
+      ui.scenarioGrid.addEventListener('change', (event) => {
+        const target = event.target;
+        if (!(target instanceof HTMLInputElement)) return;
+        if (target.dataset.scenario === 'all') {
+          const checked = target.checked;
+          for (const box of ui.scenarioGrid.querySelectorAll('input[data-scenario]')) {
+            if (box instanceof HTMLInputElement && box.dataset.scenario !== 'all') {
+              box.checked = checked;
+            }
+          }
+        } else {
+          const boxes = Array.from(
+            ui.scenarioGrid.querySelectorAll('input[data-scenario]:not([data-scenario="all"])')
+          );
+          const allChecked = boxes.every((box) => box instanceof HTMLInputElement && box.checked);
+          const all = ui.scenarioGrid.querySelector('input[data-scenario="all"]');
+          if (all instanceof HTMLInputElement) {
+            all.checked = allChecked;
+          }
+        }
+      });
+
+      renderScenarioGrid();
+      drawRewardChart();
+    </script>
+  </body>
+</html>
