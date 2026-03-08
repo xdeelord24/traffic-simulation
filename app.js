@@ -129,7 +129,7 @@ const ADAPTIVE_COORDINATION_BONUS = 0.8;
 const SIGNAL_YELLOW_DURATION = 1.4;
 const SIGNAL_ALL_RED_DURATION = 0.7;
 const YELLOW_CLEARANCE_DISTANCE = STOP_BUFFER + 6;
-const STUCK_TICKS_RELAXED_ENTRY = 90;
+const STUCK_TICKS_RELAXED_ENTRY = 15;
 const SIGNAL_MODE_VALUES = ['none', 'adaptive', 'fixed', 'external', 'rl'];
 const MIN_VIEW_ZOOM = 0.45;
 const MAX_VIEW_ZOOM = 2.8;
@@ -2066,21 +2066,49 @@ function buildIntersectionReservations(dt = FIXED_DT) {
     const remainingDistance = segment.length * (1 - vehicle.progress);
     const reserveLookahead =
       Math.max(vehicle.speed, getVehicleTargetRoadSpeed(vehicle, segment.road)) * Math.max(dt, FIXED_DT) + 1;
-    const committedToIntersection =
-      remainingDistance <= getVehicleCommitDistance(vehicle, segment) + reserveLookahead;
-    // Only vehicles with green can reserve the intersection they're approaching.
-    // Otherwise a stopped vehicle at red blocks vehicles with green from entering.
-    if (
+    const physicallyCommitted = remainingDistance <= getVehicleCommitDistance(vehicle, segment);
+    // Only physically committed (past stop line) or able-to-clear vehicles get reservation.
+    // Vehicles at the stop line that cannot find a lane must NOT reserve — they would block others.
+    const canClear = physicallyCommitted || canVehicleClearIntersection(vehicle, segment);
+    const stuckTicks = vehicle.stuckAtIntersectionTicks ?? 0;
+    const waitingLongEnough = stuckTicks >= STUCK_TICKS_RELAXED_ENTRY;
+    const nextEndId = vehicle.route[vehicle.segmentIndex + 2];
+    const nextRoad = nextEndId ? findRoadBetween(segment.endId, nextEndId) : null;
+    const nextStart = getIntersectionById(segment.endId);
+    const nextEnd = getIntersectionById(nextEndId);
+    const nextLength = nextStart && nextEnd ? Math.max(1, distance(nextStart, nextEnd)) : 1;
+    const minNextEntryProgress =
+      nextRoad
+        ? getIntersectionReleaseDistance({ length: nextLength, road: nextRoad }, vehicle) / nextLength
+        : 0;
+    const relaxedLaneOk =
+      waitingLongEnough &&
+      nextEndId &&
+      nextRoad &&
+      pickLaneRelaxed(
+        segment.endId,
+        nextEndId,
+        vehicle.id,
+        minNextEntryProgress,
+        nextRoad,
+        vehicle
+      ) >= 0;
+    const allowReservation =
       remainingDistance <= getVehicleReserveDistance(vehicle, segment) + reserveLookahead &&
       isLaneGreen(segment, remainingDistance, vehicle) &&
-      (committedToIntersection || canVehicleClearIntersection(vehicle, segment))
-    ) {
-      reserveClosest(segment.endId, vehicle.id, remainingDistance);
+      (canClear || relaxedLaneOk);
+    if (allowReservation) {
+      const distForReservation = canClear
+        ? remainingDistance
+        : remainingDistance - (waitingLongEnough ? 200 : 0);
+      reserveClosest(segment.endId, vehicle.id, Math.max(1, distForReservation));
     }
 
     const distanceFromStart = segment.length * vehicle.progress;
     const exitReserveDistance = getIntersectionReleaseDistance(segment, vehicle);
-    if (distanceFromStart <= exitReserveDistance) {
+    const stuckAtStartOfSegment =
+      vehicle.speed < 2 && vehicle.progress < 0.2;
+    if (distanceFromStart <= exitReserveDistance && !stuckAtStartOfSegment) {
       reserveClosest(segment.startId, vehicle.id, distanceFromStart);
     }
   }
@@ -3289,6 +3317,11 @@ function updateVehicles(dt) {
         targetSpeed = Math.min(targetSpeed, stopDistance * 2.2);
       }
       brakingForControl = true;
+      if (laneGreen && intersectionBlocked && stopDistance < 30) {
+        vehicle.stuckAtIntersectionTicks = (vehicle.stuckAtIntersectionTicks ?? 0) + 1;
+      }
+    } else if (remainingDistance > getVehicleReserveDistance(vehicle, segment) + 20) {
+      vehicle.stuckAtIntersectionTicks = 0;
     }
 
     if (targetSpeed < startingSpeed - 0.35) {
@@ -3335,6 +3368,9 @@ function updateVehicles(dt) {
         crossingReservedForVehicle && (committedCrossing || crossingGreen);
 
       if (!canEnterIntersection) {
+        if (crossingGreen && crossingOwner && crossingOwner !== vehicle.id) {
+          vehicle.stuckAtIntersectionTicks = (vehicle.stuckAtIntersectionTicks ?? 0) + 1;
+        }
         const holdProgress = clamp(
           Math.max(tickStartProgress, getStopLineProgress(segment, vehicle)),
           0,
