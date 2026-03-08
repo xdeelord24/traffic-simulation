@@ -1,0 +1,366 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Traffic Backtest: Adaptive vs External AI</title>
+    <link rel="stylesheet" href="styles.css" />
+    <style>
+      .backtest-panel {
+        margin: 1rem 0;
+        padding: 1rem;
+        background: rgba(15, 31, 46, 0.6);
+        border-radius: 8px;
+        border: 1px solid rgba(107, 128, 149, 0.4);
+      }
+      .backtest-panel h2 { margin-top: 0; }
+      .backtest-results {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 1rem;
+        margin-top: 1rem;
+      }
+      .backtest-result {
+        padding: 1rem;
+        border-radius: 8px;
+        border: 1px solid rgba(107, 128, 149, 0.4);
+      }
+      .backtest-result.adaptive { background: rgba(42, 157, 143, 0.15); }
+      .backtest-result.external { background: rgba(251, 133, 0, 0.15); }
+      .backtest-result.static { background: rgba(107, 128, 149, 0.2); }
+      .backtest-result h3 { margin-top: 0; }
+      .backtest-result pre { margin: 0.5rem 0; font-size: 12px; }
+      .backtest-winner {
+        margin-top: 1rem;
+        padding: 1rem;
+        font-weight: bold;
+        text-align: center;
+        border-radius: 8px;
+      }
+      .backtest-winner.adaptive { background: rgba(42, 157, 143, 0.3); }
+      .backtest-winner.external { background: rgba(251, 133, 0, 0.3); }
+      .backtest-winner.tie { background: rgba(107, 128, 149, 0.3); }
+      #backtest-log { font-size: 11px; max-height: 180px; overflow-y: auto; }
+      .scenario-table { width: 100%; font-size: 12px; margin-top: 1rem; border-collapse: collapse; }
+      .scenario-table th, .scenario-table td { padding: 6px 8px; text-align: left; border: 1px solid rgba(107, 128, 149, 0.4); }
+      .scenario-table th { background: rgba(15, 31, 46, 0.8); }
+      .scenario-table .adaptive-wins { color: #2a9d8f; }
+      .scenario-table .external-wins { color: #fb8500; }
+      .scenario-table .static-wins { color: #6f8095; }
+      .summary-row { font-weight: bold; background: rgba(15, 31, 46, 0.5); }
+    </style>
+  </head>
+  <body>
+    <div id="app-shell">
+      <aside class="control-panel">
+        <header class="panel-header">
+          <h1>Traffic Backtest</h1>
+          <p>Compare Adaptive AI vs External AI at 120 vehicles/min spawn rate.</p>
+        </header>
+
+        <section class="group backtest-panel">
+          <h2>Backtest</h2>
+          <p class="tiny">Runs 3 min per scenario per mode at 120/min spawn, 3 trials averaged per scenario. Tests 8 road designs. Compares Adaptive AI, External AI (pressure-based), and Static (fixed 30s cycle, typical real-life). Uses seeded RNG for reproducible results.</p>
+          <div class="button-row">
+            <button id="run-backtest">Run All Scenarios</button>
+          </div>
+          <pre id="backtest-log"></pre>
+          <div id="backtest-results" class="backtest-results" style="display: none;"></div>
+        </section>
+
+        <section class="group">
+          <h2>Simulation</h2>
+          <p class="tiny">Spawn rate is set to 120/min during backtest.</p>
+          <div class="row">
+            <label for="spawn-rate">Spawn rate <span id="spawn-rate-value"></span></label>
+            <input id="spawn-rate" type="range" min="0" max="120" value="120" />
+          </div>
+        </section>
+
+        <section class="group">
+          <h2>Network</h2>
+          <div class="button-row">
+            <button id="sample-grid">Add Sample Grid</button>
+            <button id="clear-map" class="danger">Clear Map</button>
+          </div>
+          <div id="weight-table" class="table-wrap"></div>
+        </section>
+
+        <section class="group">
+          <h2>Selection</h2>
+          <div id="inspector" class="inspector"></div>
+        </section>
+
+        <section class="group">
+          <h2>Stats</h2>
+          <pre id="stats" class="stats"></pre>
+        </section>
+      </aside>
+
+      <main id="stage-wrap" aria-label="Traffic simulation stage">
+        <canvas id="sim-canvas" width="1200" height="760"></canvas>
+      </main>
+    </div>
+
+    <script type="module" src="app.js"></script>
+    <script type="module">
+      const BACKTEST_DURATION_S = 180;
+      const BACKTEST_TRIALS = 3;
+
+      function scenarioSeed(scenarioId, trial) {
+        let h = 0;
+        for (let i = 0; i < scenarioId.length; i++) h = (h * 31 + scenarioId.charCodeAt(i)) | 0;
+        return ((h ^ (trial * 0x9e3779b9)) >>> 0) || 1;
+      }
+
+      function createPressureBasedAgent() {
+        const QUEUE_WEIGHT = 2.8;
+        const FLOW_WEIGHT = 1.2;
+        const WAIT_AGE_WEIGHT = 0.5;
+        const MIN_GREEN = 3;
+        const MAX_GREEN = 12;
+        const STARVATION_SEC = 6;
+        const SWITCH_MARGIN_ABS = 0.5;
+        const SWITCH_MARGIN_RATIO = 1.25;
+        const DRY_THRESHOLD = 0.3;
+
+        return (snapshot) => {
+          const decisions = [];
+          const roads = snapshot.roads || [];
+          for (const node of snapshot.intersections) {
+            const approaches = node.signal?.available_approaches || [];
+            if (approaches.length === 0) continue;
+
+            const queue = node.queue || {};
+            const flow = node.approach_flow || {};
+            const waitAges = node.signal?.wait_ages_s || {};
+            const phase = node.signal?.phase || approaches[0];
+            const elapsed = node.signal?.elapsed_s ?? 0;
+            const maxGreen = node.signal?.max_green_s ?? MAX_GREEN;
+
+            let downstreamOccupancy = 0;
+            const exitRoads = roads.filter((r) => r.from === node.id);
+            if (exitRoads.length > 0) {
+              const sum = exitRoads.reduce((s, r) => s + (r.occupancy_fwd ?? 0), 0);
+              downstreamOccupancy = sum / exitRoads.length;
+            }
+            const downstreamFull = downstreamOccupancy > 0.85;
+            const switchMarginMult = downstreamFull ? 1.4 : 1;
+
+            const coord = node.coordination_bonus || {};
+            const scores = {};
+            for (const a of approaches) {
+              scores[a] =
+                (queue[a] || 0) * QUEUE_WEIGHT +
+                (flow[a] || 0) * FLOW_WEIGHT +
+                (waitAges[a] || 0) * WAIT_AGE_WEIGHT +
+                (coord[a] || 0);
+            }
+
+            let bestApproach = null;
+            for (const a of approaches) {
+              if (!bestApproach || (scores[a] || 0) > (scores[bestApproach] || 0)) {
+                bestApproach = a;
+              }
+            }
+
+            const currentScore = scores[phase] || 0;
+            const bestScore = bestApproach ? scores[bestApproach] || 0 : 0;
+            const currentDemand = (queue[phase] || 0) + (flow[phase] || 0) * 0.5;
+            const alternateDemand = bestApproach && bestApproach !== phase && bestScore > 0.2;
+            const marginAbs = SWITCH_MARGIN_ABS * switchMarginMult;
+            const marginRatio = Math.pow(SWITCH_MARGIN_RATIO, switchMarginMult);
+            const betterDemandAbs = bestApproach && bestApproach !== phase && bestScore >= currentScore + marginAbs;
+            const betterDemandRatio = bestApproach && bestApproach !== phase && currentScore > 0.1 && bestScore >= currentScore * marginRatio;
+
+            let maxWait = 0;
+            let starvationApproach = null;
+            for (const a of approaches) {
+              const w = waitAges[a] || 0;
+              if (w > maxWait) {
+                maxWait = w;
+                starvationApproach = a;
+              }
+            }
+            const starvationForced =
+              starvationApproach &&
+              starvationApproach !== phase &&
+              maxWait >= STARVATION_SEC;
+
+            const mustSwitchMaxGreen = elapsed >= maxGreen;
+            const shouldSwitch =
+              elapsed >= MIN_GREEN &&
+              (starvationForced ||
+                betterDemandAbs ||
+                betterDemandRatio ||
+                (currentDemand <= DRY_THRESHOLD && alternateDemand));
+
+            let nextPhase = phase;
+            if (mustSwitchMaxGreen || shouldSwitch) {
+              nextPhase =
+                starvationForced
+                  ? starvationApproach
+                  : alternateDemand || betterDemandAbs || betterDemandRatio
+                    ? bestApproach
+                    : null;
+            }
+
+            if (nextPhase && nextPhase !== phase) {
+              decisions.push({ id: node.id, phase: nextPhase });
+            } else if (mustSwitchMaxGreen && !nextPhase) {
+              decisions.push({ id: node.id, switch: true });
+            }
+          }
+          return decisions;
+        };
+      }
+      const SPAWN_RATE = 120;
+      const SCENARIOS = [
+        { id: 'grid3x3', name: '3×3 Grid' },
+        { id: 'grid4x4', name: '4×4 Grid' },
+        { id: 'linear', name: 'Linear (5 nodes)' },
+        { id: 'cross', name: 'Cross (5-way)' },
+        { id: 'star', name: 'Star (4 spokes)' },
+        { id: 'diamond', name: 'Diamond' },
+        { id: 'bottleneck', name: 'Bottleneck' },
+        { id: 'ring', name: 'Ring (6 nodes)' },
+      ];
+
+      function log(msg) {
+        const el = document.getElementById('backtest-log');
+        if (el) {
+          el.textContent += msg + '\n';
+          el.scrollTop = el.scrollHeight;
+        }
+      }
+
+      function runOneMode(mode, label, scenarioId, seed) {
+        return new Promise((resolve) => {
+          window.buildScenario(scenarioId || 'grid3x3');
+          window.setSpawnRate(SPAWN_RATE);
+          window.setBacktestSeed(seed);
+          window.setAllSignalModes(mode);
+
+          if (mode === 'external') {
+            window.setTrafficLightAgent(createPressureBasedAgent());
+          } else {
+            window.setTrafficLightAgent(null);
+          }
+          if (mode === 'fixed') {
+            window.setFixedGreenForAll(30);
+          }
+
+          let steps = 0;
+          const step = () => {
+            window.stepSimulation(1);
+            steps += 1;
+            if (steps < BACKTEST_DURATION_S) {
+              requestAnimationFrame(step);
+            } else {
+              const m = window.getBacktestMetrics();
+              resolve({ label, ...m });
+            }
+          };
+          requestAnimationFrame(step);
+        });
+      }
+
+      document.getElementById('run-backtest').addEventListener('click', async () => {
+        const btn = document.getElementById('run-backtest');
+        btn.disabled = true;
+        document.getElementById('backtest-log').textContent = '';
+        document.getElementById('backtest-results').style.display = 'none';
+
+        log(`Starting multi-scenario backtest @ 120/min, 3 min per run, ${BACKTEST_TRIALS} trials per scenario...`);
+        const results = [];
+
+        for (const scenario of SCENARIOS) {
+          log(`\n--- ${scenario.name} ---`);
+          let adaptiveSum = 0, externalSum = 0, staticSum = 0;
+
+          for (let t = 0; t < BACKTEST_TRIALS; t++) {
+            const seed = scenarioSeed(scenario.id, t);
+            log(`  Trial ${t + 1}/${BACKTEST_TRIALS}...`);
+            const adaptive = await runOneMode('adaptive', 'Adaptive', scenario.id, seed);
+            const external = await runOneMode('external', 'External', scenario.id, seed);
+            const static_ = await runOneMode('fixed', 'Static', scenario.id, seed);
+            adaptiveSum += adaptive.vehiclesCompleted;
+            externalSum += external.vehiclesCompleted;
+            staticSum += static_.vehiclesCompleted;
+          }
+
+          const adaptiveAvg = Math.round(adaptiveSum / BACKTEST_TRIALS);
+          const externalAvg = Math.round(externalSum / BACKTEST_TRIALS);
+          const staticAvg = Math.round(staticSum / BACKTEST_TRIALS);
+          log(`  Avg: Adaptive ${adaptiveAvg}, External ${externalAvg}, Static ${staticAvg}`);
+
+          const best = Math.max(adaptiveAvg, externalAvg, staticAvg);
+          const winner = adaptiveAvg === best ? 'adaptive'
+            : externalAvg === best ? 'external'
+            : staticAvg === best ? 'static' : 'tie';
+          results.push({
+            scenario: scenario.name,
+            adaptive: { vehiclesCompleted: adaptiveAvg },
+            external: { vehiclesCompleted: externalAvg },
+            static: { vehiclesCompleted: staticAvg },
+            winner,
+          });
+        }
+
+        window.clearBacktestSeed();
+
+        log('\nDone. Building summary...');
+
+        let adaptiveWins = 0, externalWins = 0, staticWins = 0, ties = 0;
+        let adaptiveTotal = 0, externalTotal = 0, staticTotal = 0;
+
+        const rows = results.map((r) => {
+          if (r.winner === 'adaptive') adaptiveWins++;
+          else if (r.winner === 'external') externalWins++;
+          else if (r.winner === 'static') staticWins++;
+          else ties++;
+          adaptiveTotal += r.adaptive.vehiclesCompleted;
+          externalTotal += r.external.vehiclesCompleted;
+          staticTotal += r.static.vehiclesCompleted;
+
+          const winClass = r.winner === 'adaptive' ? 'adaptive-wins' : r.winner === 'external' ? 'external-wins' : r.winner === 'static' ? 'static-wins' : '';
+          const winText = r.winner === 'adaptive' ? 'Adaptive' : r.winner === 'external' ? 'External' : r.winner === 'static' ? 'Static' : 'Tie';
+          return `<tr><td>${r.scenario}</td><td>${r.adaptive.vehiclesCompleted}</td><td>${r.external.vehiclesCompleted}</td><td>${r.static.vehiclesCompleted}</td><td class="${winClass}">${winText}</td></tr>`;
+        }).join('');
+
+        const bestTotal = Math.max(adaptiveTotal, externalTotal, staticTotal);
+        const overallWinner = adaptiveTotal === bestTotal ? 'adaptive' : externalTotal === bestTotal ? 'external' : staticTotal === bestTotal ? 'static' : 'tie';
+        const overallText = overallWinner === 'adaptive'
+          ? `Adaptive AI wins overall (${adaptiveTotal} total)`
+          : overallWinner === 'external'
+            ? `External AI wins overall (${externalTotal} total)`
+            : overallWinner === 'static'
+              ? `Static (fixed) wins overall (${staticTotal} total)`
+              : 'Tie overall';
+
+        const resultsDiv = document.getElementById('backtest-results');
+        resultsDiv.style.display = 'block';
+        resultsDiv.innerHTML = `
+          <div class="backtest-result" style="grid-column: 1 / -1;">
+            <h3>Summary</h3>
+            <p>Adaptive won ${adaptiveWins}, External won ${externalWins}, Static won ${staticWins}, ${ties} ties.</p>
+            <p><strong>${overallText}</strong></p>
+            <table class="scenario-table">
+              <thead><tr><th>Scenario</th><th>Adaptive</th><th>External</th><th>Static (30s)</th><th>Winner</th></tr></thead>
+              <tbody>${rows}</tbody>
+              <tr class="summary-row"><td>Total</td><td>${adaptiveTotal}</td><td>${externalTotal}</td><td>${staticTotal}</td><td>${overallWinner === 'adaptive' ? 'Adaptive' : overallWinner === 'external' ? 'External' : overallWinner === 'static' ? 'Static' : 'Tie'}</td></tr>
+            </table>
+          </div>
+        `;
+
+        const winnerEl = document.createElement('div');
+        winnerEl.className = `backtest-winner ${overallWinner}`;
+        winnerEl.textContent = overallText;
+        winnerEl.style.gridColumn = '1 / -1';
+        resultsDiv.appendChild(winnerEl);
+
+        btn.disabled = false;
+      });
+    </script>
+  </body>
+</html>

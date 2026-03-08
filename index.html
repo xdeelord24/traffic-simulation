@@ -1,0 +1,85 @@
+﻿<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Traffic Network Sandbox</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div id="app-shell">
+      <aside class="control-panel">
+        <header class="panel-header">
+          <h1>Traffic Network Sandbox</h1>
+          <p>Design intersections and roads, then simulate weighted or random traffic flow.</p>
+        </header>
+
+        <section class="group">
+          <h2>Editor</h2>
+          <div class="mode-row">
+            <button id="mode-add" class="mode-btn" data-mode="add-intersection">Add Intersection (A)</button>
+            <button id="mode-connect" class="mode-btn" data-mode="connect-roads">Connect Roads (B)</button>
+            <button id="mode-select" class="mode-btn" data-mode="select">Select/Move (Enter)</button>
+          </div>
+        </section>
+
+        <section class="group">
+          <h2>Simulation</h2>
+          <div class="button-row">
+            <button id="toggle-run">Pause</button>
+            <button id="step-btn">Step +0.5s</button>
+            <button id="clear-traffic">Clear Vehicles</button>
+          </div>
+          <div class="row">
+            <label for="spawn-mode">Spawn mode</label>
+            <select id="spawn-mode">
+              <option value="weighted">Weighted Demand</option>
+              <option value="random">Random Demand</option>
+            </select>
+          </div>
+          <div class="row">
+            <label for="spawn-rate">Spawn rate <span id="spawn-rate-value"></span></label>
+            <input id="spawn-rate" type="range" min="0" max="120" value="26" />
+          </div>
+          <div class="row checkbox-row">
+            <label>
+              <input id="auto-spawn" type="checkbox" checked />
+              Auto spawn traffic
+            </label>
+          </div>
+        </section>
+
+        <section class="group">
+          <h2>Network</h2>
+          <div class="button-row">
+            <button id="sample-grid">Add Sample Grid</button>
+            <button id="clear-map" class="danger">Clear Map</button>
+          </div>
+          <div id="weight-table" class="table-wrap"></div>
+        </section>
+
+        <section class="group">
+          <h2>Selection</h2>
+          <div id="inspector" class="inspector">Select an intersection or road.</div>
+        </section>
+
+        <section class="group">
+          <h2>Stats</h2>
+          <pre id="stats" class="stats"></pre>
+          <p class="hint">
+            Future AI hook:
+            <code>setTrafficLightAgent(fn)</code>
+            where <code>fn(snapshot)</code> returns decisions per intersection using
+            <code>approach: N/E/S/W</code> (or legacy <code>EW/NS</code>).
+          </p>
+        </section>
+      </aside>
+
+      <main id="stage-wrap" aria-label="Traffic simulation stage">
+        <canvas id="sim-canvas" width="1200" height="760"></canvas>
+      </main>
+    </div>
+
+    <script type="module" src="app.js"></script>
+  </body>
+</html>

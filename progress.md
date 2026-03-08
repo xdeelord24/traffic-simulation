@@ -1,0 +1,106 @@
+Original prompt: Build a traffic simulation, that the user can add intersections, road design, and weights of the traffics or random traffics, because I will add an AI by assigning them as a traffic lights they will adjust the traffic lights based on the congestions
+
+## Log
+- Initialized project scaffold from an empty workspace.
+- Implemented a single-page traffic simulation (`index.html`, `styles.css`, `app.js`) with:
+  - Editor modes: add intersections, connect roads, and select/move.
+  - Road parameter editing (speed limit) and intersection weight editing (entry/exit demand).
+  - Traffic generation in weighted mode and random mode.
+  - Traffic signal behavior with fixed/adaptive/external modes.
+  - AI integration hooks: `setTrafficLightAgent`, `applyTrafficLightDecisions`, `getTrafficSnapshot`.
+  - Automation hooks: `render_game_to_text` and deterministic `advanceTime(ms)`.
+  - Fullscreen toggle (`f`) and responsive canvas resizing.
+- Added a starter sample network and controls to clear traffic/map and add another sample grid.
+- Updated vehicle movement to enforce no-collision behavior:
+  - Intersection reservation now covers both approach and just-exited vehicles.
+  - Vehicles cannot enter a new lane unless there is enough forward gap.
+  - Added lane separation and overlap resolution pass each tick.
+  - Spawned vehicles begin with safe offset from origin intersections.
+- Fixed lane-side rendering bug where opposite directions could appear in the same lane:
+  - Lane offset no longer flips by ID order; direction vector now solely determines side.
+- Added free-flow intersections (no traffic light) as default:
+  - New and sample intersections now start with `signal.mode = none`.
+  - Vehicles treat `none` intersections as always open.
+  - Inspector now includes `No traffic light (free flow)` plus optional light modes.
+  - Signal timing controls are shown only when a light mode is enabled.
+- Updated default/sample grid topology to match requested layout:
+  - Removed diagonal connectors from sample builder.
+  - Default grid is now a 3x3 orthogonal network (12 roads).
+- Updated spawning behavior to use external-road style entries:
+  - Vehicles now spawn from boundary entry roads (treated as roads that continue outside the map / no upstream node).
+  - Destination selection prefers boundary exits, so trips traverse the network from edge to edge.
+  - Added fallback to original node-based spawn for tiny/custom maps where boundary ports cannot be inferred.
+- Reworked traffic-light logic to be per-road (per inbound approach) instead of only NS/EW:
+  - Green phase is now one inbound road at a time (`N`, `E`, `S`, or `W`).
+  - Inspector allows selecting which road is currently green.
+  - Adaptive mode picks the most congested inbound road.
+  - Legacy AI decisions using `EW/NS` are still accepted and mapped to approaches.
+- Fixed vehicle snap-back / lane-freeze glitch:
+  - Removed the overlap resolution pass that could push vehicles backward within a lane.
+  - Updated denied-crossing handling to clamp at a pre-intersection progress marker instead of snapping backward by stop-buffer math.
+  - Kept free-flow intersection node color stable so no-light roads do not visually flicker with queue changes.
+- Upgraded adaptive signal AI to reduce congestion under load:
+  - Added pressure-based phase scoring that combines queued vehicles, incoming approach flow, and per-approach wait age.
+  - Added starvation prevention via wait-age tracking so neglected approaches eventually get service.
+  - Added downstream occupancy penalty (release factor) to avoid over-serving approaches whose next lane is already saturated.
+  - Improved external mode fallback: when AI is silent, fallback now chooses best-pressure approach instead of blind cycling.
+  - Expanded snapshot telemetry with `signal.wait_ages_s` and `approach_flow` per intersection for richer external AI inputs.
+- Fixed intersection U-turn behavior in boundary-spawn routing:
+  - `shortestPath` now accepts an optional previous-node constraint for the start state.
+  - Boundary spawn route generation now passes entry boundary node as the previous node, preventing immediate `A -> B -> A` reversal at the first interior intersection.
+- Backtest improvements:
+  - Seeded RNG (xorshift32) for reproducible runs; `setBacktestSeed` / `clearBacktestSeed` API.
+  - Multiple trials (3) per scenario with averaged results for more stable comparison.
+  - Each trial uses the same seed for Adaptive, External, and Static so traffic patterns are identical across modes.
+- Green-wave / coordination for ring and linear topologies:
+  - When a neighbor is green for traffic toward us, we add a coordination bonus to the approach that receives from that neighbor.
+  - Applied to both built-in Adaptive and External agent (via `coordination_bonus` in snapshot).
+  - Only active when `state.currentScenarioId` is `ring` or `linear` (set by `buildScenario`).
+
+## Validation
+- Installed local Node dependencies in workspace (`playwright`) and Playwright browser binaries under `.playwright-browsers`.
+- Ran Playwright client script from skill path:
+  - `C:\Users\jundee\.codex\skills\develop-web-game\scripts\web_game_playwright_client.js`
+  - actions file: `playwright-actions.json`
+  - output: `output/web-game/shot-0.png`, `shot-1.png`, `shot-2.png`, `state-0.json`, `state-1.json`, `state-2.json`
+- Confirmed from outputs:
+  - New intersections and road were added via automation actions (totals reached 11 intersections / 17 roads).
+  - Vehicles moved and queued behavior appears in state snapshots.
+  - Signal phase changes appear over time in state snapshots.
+  - No Playwright error JSON files were generated.
+- Collision-focused validations:
+  - Long stress run (`playwright-actions-collision.json`, 3600 frames) saved to `output/web-game-collision-5`.
+  - Verified `overlap_pairs: 0` and `collision_warning_ticks: 0` in `output/web-game-collision-5/state-0.json`.
+  - Re-ran interaction test flow to ensure editor controls still work in `output/web-game-nocollision-check`.
+- Free-flow default validation:
+  - Run output: `output/web-game-freeflow-check`.
+  - Verified all sample intersections report `"signal.mode":"none"` and vehicles continue moving in `state-0.json`.
+- Default-grid shape validation:
+  - Run output: `output/web-game-default-grid`.
+  - Verified totals are `intersections: 9`, `roads: 12` and no diagonal roads in `state-0.json`.
+- Boundary-spawn validation:
+  - Run output: `output/web-game-spawn-edge-short`.
+  - In `state-0.json`, low-progress newly spawned vehicles originate from boundary lanes (e.g., `I2->I5`, `I3->I2`).
+- Per-road signal validation:
+  - Run output: `output/web-game-traffic-light-lanes`.
+  - Snapshot now reports `available_approaches` and directional queue metrics (`N/E/S/W`) per intersection.
+- Glitch-fix validation:
+  - Run output: `output/web-game-glitch-fix` (single capture) and `output/web-game-glitch-fix-long` (5 captures, 300 frames each).
+  - No console errors in the generated run outputs.
+  - Sequential state scan reported `NO_PROGRESS_ROLLBACK_DETECTED` for same-lane vehicle tracking.
+  - Screenshot inspection confirms free-flow intersections keep stable blue node fill (no congestion color flicker in `mode: none`).
+- Adaptive-AI validation:
+  - Smoke run output: `output/web-game-ai-mode-smoke`; no Playwright error file was produced.
+  - Deterministic UI-driven benchmark (fixed vs adaptive, 90s at 120 spawns/min on same RNG seed) showed:
+    - `avgQueue`: `11.68` (fixed) -> `8.98` (adaptive), improvement `2.70`.
+    - `peakQueue`: `18` (fixed) -> `14` (adaptive), improvement `4`.
+    - `avgSpeed`: `21.27` (fixed) -> `24.65` (adaptive), improvement `3.38`.
+- U-turn fix validation:
+  - Run output: `output/web-game-no-uturn-check` (`8` captures, `300` frames each).
+  - State scan across captures reported `NO_REVERSE_EDGE_TRANSITIONS_DETECTED` (no `A->B` then `B->A` transitions for the same vehicle).
+  - No Playwright error file was produced for the run.
+
+## TODO
+- Optional: add persistence (save/load network JSON) if needed for larger experiments.
+- Optional: expose richer per-lane congestion metrics (wait time, throughput) for AI training signals.
+- Optional: remove `C:\Users\jundee\.codex\skills\develop-web-game\node_modules` junction if no longer needed.
