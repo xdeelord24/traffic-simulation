@@ -6,10 +6,14 @@ if (!TF) {
 
 export const RL_ACTIONS = ['N', 'E', 'S', 'W'];
 export const DEFAULT_MAX_INTERSECTIONS = 16;
-export const FEATURES_PER_INTERSECTION = 12;
+export const FEATURES_PER_INTERSECTION = 22;
 
 const QUEUE_SCALE = 12;
 const FLOW_SCALE = 8;
+const WAIT_AGE_SCALE = 12;
+const COORD_SCALE = 1.5;
+const ELAPSED_SCALE = 12;
+const OCCUPANCY_SCALE = 1.5;
 
 function numericId(id) {
   const numeric = Number(String(id || '').replace(/[^0-9]/g, ''));
@@ -32,11 +36,58 @@ export function encodeState(snapshot, maxIntersections = DEFAULT_MAX_INTERSECTIO
   return prepareObservation(snapshot, maxIntersections, eligibleMode).observation;
 }
 
-export function computeReward(prevMetrics, currMetrics, phaseChanges = 0) {
+export function computeRewardBreakdown(prevMetrics, currMetrics, phaseChanges = 0) {
   const completedDelta =
     Math.max(0, (currMetrics?.vehiclesCompleted || 0) - (prevMetrics?.vehiclesCompleted || 0));
   const totalQueue = currMetrics?.totalQueue || 0;
-  return completedDelta - totalQueue * 0.02 - phaseChanges * 0.5;
+  const queueDelta = totalQueue - (prevMetrics?.totalQueue || 0);
+  const speedDelta = (currMetrics?.avgSpeed || 0) - (prevMetrics?.avgSpeed || 0);
+  const stoppedVehicles = currMetrics?.stoppedVehicles || 0;
+  const overlapDelta = Math.max(
+    0,
+    (currMetrics?.overlapPairs || 0) - (prevMetrics?.overlapPairs || 0)
+  );
+  const collisionDelta = Math.max(
+    0,
+    (currMetrics?.collisionWarnings || 0) - (prevMetrics?.collisionWarnings || 0)
+  );
+
+  const terms = {
+    completed: completedDelta * 2.4,
+    speed: speedDelta * 0.08,
+    queue: -totalQueue * 0.015,
+    queueGrowth: -Math.max(0, queueDelta) * 0.05,
+    stopped: -stoppedVehicles * 0.025,
+    phaseSwitch: -phaseChanges * 0.18,
+    overlap: -overlapDelta * 2.5,
+    collision: -collisionDelta * 0.75,
+  };
+  const total =
+    terms.completed +
+    terms.speed +
+    terms.queue +
+    terms.queueGrowth +
+    terms.stopped +
+    terms.phaseSwitch +
+    terms.overlap +
+    terms.collision;
+
+  return {
+    total,
+    terms,
+    completedDelta,
+    totalQueue,
+    queueDelta,
+    speedDelta,
+    stoppedVehicles,
+    phaseChanges,
+    overlapDelta,
+    collisionDelta,
+  };
+}
+
+export function computeReward(prevMetrics, currMetrics, phaseChanges = 0) {
+  return computeRewardBreakdown(prevMetrics, currMetrics, phaseChanges).total;
 }
 
 export function buildPressureFallbackDecisions(snapshot, eligibleMode = 'rl') {
@@ -118,10 +169,20 @@ export function buildPressureFallbackDecisions(snapshot, eligibleMode = 'rl') {
   return decisions;
 }
 
+function buildRoadMaps(snapshot) {
+  const outgoing = new Map();
+  for (const road of snapshot.roads || []) {
+    if (!outgoing.has(road.from)) outgoing.set(road.from, []);
+    outgoing.get(road.from).push(road);
+  }
+  return { outgoing };
+}
+
 function prepareObservation(snapshot, maxIntersections, eligibleMode = null) {
   const ordered = sortIntersections(snapshot.intersections || []).filter((node) =>
     eligibleMode ? node.signal?.mode === eligibleMode : true
   );
+  const { outgoing } = buildRoadMaps(snapshot);
 
   const observation = new Float32Array(maxIntersections * FEATURES_PER_INTERSECTION);
   const actionMask = new Float32Array(maxIntersections * RL_ACTIONS.length);
@@ -132,9 +193,21 @@ function prepareObservation(snapshot, maxIntersections, eligibleMode = null) {
     const node = limited[i];
     const queue = node.queue || {};
     const flow = node.approach_flow || {};
+    const waitAges = node.signal?.wait_ages_s || {};
+    const coord = node.coordination_bonus || {};
     const phase = node.signal?.phase || null;
     const offset = i * FEATURES_PER_INTERSECTION;
     const phaseHot = oneHotPhase(phase);
+    const exits = outgoing.get(node.id) || [];
+    const meanOccupancy =
+      exits.length > 0
+        ? exits.reduce((sum, road) => sum + (road.occupancy_fwd ?? 0), 0) / exits.length
+        : 0;
+    const maxOccupancy =
+      exits.length > 0
+        ? exits.reduce((best, road) => Math.max(best, road.occupancy_fwd ?? 0), 0)
+        : 0;
+    const elapsedNorm = normalize(node.signal?.elapsed_s || 0, ELAPSED_SCALE);
 
     observation[offset] = normalize(queue.N, QUEUE_SCALE);
     observation[offset + 1] = normalize(queue.E, QUEUE_SCALE);
@@ -144,10 +217,23 @@ function prepareObservation(snapshot, maxIntersections, eligibleMode = null) {
     observation[offset + 5] = normalize(flow.E, FLOW_SCALE);
     observation[offset + 6] = normalize(flow.S, FLOW_SCALE);
     observation[offset + 7] = normalize(flow.W, FLOW_SCALE);
-    observation[offset + 8] = phaseHot[0];
-    observation[offset + 9] = phaseHot[1];
-    observation[offset + 10] = phaseHot[2];
-    observation[offset + 11] = phaseHot[3];
+    observation[offset + 8] = normalize(waitAges.N, WAIT_AGE_SCALE);
+    observation[offset + 9] = normalize(waitAges.E, WAIT_AGE_SCALE);
+    observation[offset + 10] = normalize(waitAges.S, WAIT_AGE_SCALE);
+    observation[offset + 11] = normalize(waitAges.W, WAIT_AGE_SCALE);
+    observation[offset + 12] = phaseHot[0];
+    observation[offset + 13] = phaseHot[1];
+    observation[offset + 14] = phaseHot[2];
+    observation[offset + 15] = phaseHot[3];
+    observation[offset + 16] = normalize(coord.N, COORD_SCALE);
+    observation[offset + 17] = normalize(coord.E, COORD_SCALE);
+    observation[offset + 18] = normalize(coord.S, COORD_SCALE);
+    observation[offset + 19] = normalize(coord.W, COORD_SCALE);
+    observation[offset + 20] = elapsedNorm;
+    observation[offset + 21] = Math.max(
+      normalize(meanOccupancy, OCCUPANCY_SCALE),
+      normalize(maxOccupancy, OCCUPANCY_SCALE)
+    );
 
     const approaches = node.signal?.available_approaches || [];
     activeMask[i] = 1;
@@ -235,6 +321,47 @@ export function decodeActions(actionIndices, snapshot, options = {}) {
   return decisions;
 }
 
+export function buildTeacherActionIndices(snapshot, options = {}) {
+  const {
+    maxIntersections = DEFAULT_MAX_INTERSECTIONS,
+    eligibleMode = 'rl',
+    decisions = null,
+  } = options;
+  const prepared = prepareObservation(snapshot, maxIntersections, eligibleMode);
+  const teacherDecisions = decisions || buildPressureFallbackDecisions(snapshot, eligibleMode);
+  const teacherPhaseById = new Map();
+
+  for (const node of prepared.intersections) {
+    const approaches = node.signal?.available_approaches || [];
+    const currentPhase = node.signal?.phase;
+    teacherPhaseById.set(
+      node.id,
+      approaches.includes(currentPhase) ? currentPhase : approaches[0] || RL_ACTIONS[0]
+    );
+  }
+  for (const decision of teacherDecisions) {
+    if (decision?.id && typeof decision.phase === 'string') {
+      teacherPhaseById.set(decision.id, decision.phase);
+    }
+  }
+
+  const actionIndices = new Array(maxIntersections).fill(0);
+  for (let i = 0; i < prepared.intersections.length; i += 1) {
+    const node = prepared.intersections[i];
+    const approaches = node.signal?.available_approaches || [];
+    const phase = teacherPhaseById.get(node.id) || approaches[0] || RL_ACTIONS[0];
+    const safePhase = approaches.includes(phase) ? phase : approaches[0] || RL_ACTIONS[0];
+    const actionIndex = RL_ACTIONS.indexOf(safePhase);
+    actionIndices[i] = actionIndex >= 0 ? actionIndex : 0;
+  }
+
+  return {
+    actionIndices,
+    prepared,
+    decisions: teacherDecisions,
+  };
+}
+
 function buildActorCriticModel(inputSize, outputSize) {
   const input = TF.input({ shape: [inputSize] });
   const hidden1 = TF.layers.dense({ units: 128, activation: 'relu' }).apply(input);
@@ -263,6 +390,7 @@ export class RLAgent {
     this.model = buildActorCriticModel(this.inputSize, this.outputSize);
     this.optimizer = TF.train.adam(this.learningRate);
     this.rollout = [];
+    this.imitationBuffer = [];
     this.episodeStart = 0;
   }
 
@@ -322,6 +450,15 @@ export class RLAgent {
       done,
       advantage: 0,
       returnValue: 0,
+    });
+  }
+
+  addImitationSample(transition, teacherActionIndices) {
+    this.imitationBuffer.push({
+      observation: Float32Array.from(transition.observation),
+      actionMask: Float32Array.from(transition.actionMask),
+      activeMask: Float32Array.from(transition.activeMask),
+      teacherActionIndices: [...teacherActionIndices],
     });
   }
 
@@ -416,6 +553,61 @@ export class RLAgent {
     advantageTensor.dispose();
     this.rollout = [];
     this.episodeStart = 0;
+    return lastMetrics;
+  }
+
+  async updateImitation() {
+    if (!this.imitationBuffer.length) {
+      return { imitationLoss: 0, entropy: 0 };
+    }
+
+    const batch = this.imitationBuffer.length;
+    const observations = this.imitationBuffer.map((item) => Array.from(item.observation));
+    const teacherActions = this.imitationBuffer.map((item) => item.teacherActionIndices);
+    const actionMasks = this.imitationBuffer.map((item) =>
+      Array.from(item.actionMask).reduce((rows, _, index, source) => {
+        if (index % RL_ACTIONS.length === 0) {
+          rows.push(source.slice(index, index + RL_ACTIONS.length));
+        }
+        return rows;
+      }, [])
+    );
+    const activeMasks = this.imitationBuffer.map((item) => Array.from(item.activeMask));
+
+    const obsTensor = TF.tensor2d(observations, [batch, this.inputSize]);
+    const teacherTensor = TF.tensor2d(teacherActions, [batch, this.maxIntersections], 'int32');
+    const actionMaskTensor = TF.tensor3d(actionMasks, [batch, this.maxIntersections, RL_ACTIONS.length]);
+    const activeMaskTensor = TF.tensor2d(activeMasks, [batch, this.maxIntersections]);
+
+    let lastMetrics = { imitationLoss: 0, entropy: 0 };
+    for (let epoch = 0; epoch < Math.max(2, this.updateEpochs); epoch += 1) {
+      this.optimizer.minimize(() => {
+        const outputs = this.model.apply(obsTensor, { training: true });
+        const policy = outputs[0];
+        const reshapedPolicy = policy.reshape([batch, this.maxIntersections, RL_ACTIONS.length]);
+        const maskedLogits = reshapedPolicy.add(TF.sub(1, actionMaskTensor).mul(-1e9));
+        const logProbs = TF.logSoftmax(maskedLogits, -1);
+        const probs = TF.softmax(maskedLogits, -1);
+        const teacherOneHot = TF.oneHot(teacherTensor, RL_ACTIONS.length).toFloat();
+        const nll = logProbs.mul(teacherOneHot).sum(-1).neg();
+        const imitationLoss = nll.mul(activeMaskTensor).sum(-1).mean();
+        const entropy = probs.mul(logProbs).sum(-1).neg().mul(activeMaskTensor).sum(-1).mean();
+        const loss = imitationLoss.sub(entropy.mul(this.entropyCoeff * 0.5));
+
+        lastMetrics = {
+          imitationLoss: Number(imitationLoss.dataSync()[0]),
+          entropy: Number(entropy.dataSync()[0]),
+        };
+        return loss;
+      }, false);
+      await TF.nextFrame();
+    }
+
+    obsTensor.dispose();
+    teacherTensor.dispose();
+    actionMaskTensor.dispose();
+    activeMaskTensor.dispose();
+    this.imitationBuffer = [];
     return lastMetrics;
   }
 

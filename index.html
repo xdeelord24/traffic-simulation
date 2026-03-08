@@ -47,14 +47,55 @@
               Auto spawn traffic
             </label>
           </div>
+          <div class="row">
+            <label for="global-signal-mode">Traffic light AI for all intersections</label>
+            <select id="global-signal-mode">
+              <option value="mixed" disabled>Mixed / per intersection</option>
+              <option value="none">No traffic light (free flow)</option>
+              <option value="adaptive" selected>Adaptive AI (pressure)</option>
+              <option value="rl">RL Agent (trained)</option>
+              <option value="fixed">Static (fixed cycle, typical)</option>
+              <option value="external">External AI controlled</option>
+            </select>
+          </div>
+          <p class="hint">Use this to switch every traffic light at once.</p>
         </section>
 
         <section class="group">
           <h2>Network</h2>
+          <div class="row">
+            <label for="scenario-preset">Scenario</label>
+            <select id="scenario-preset">
+              <option value="sample-grid" selected>Sample Grid</option>
+              <option value="grid3x3">3x3 Grid</option>
+              <option value="grid4x4">4x4 Grid</option>
+              <option value="linear">Linear</option>
+              <option value="cross">Cross</option>
+              <option value="star">Star</option>
+              <option value="diamond">Diamond</option>
+              <option value="bottleneck">Bottleneck</option>
+              <option value="ring">Ring</option>
+            </select>
+          </div>
+          <div class="row">
+            <label for="scenario-lanes">Road lanes</label>
+            <select id="scenario-lanes">
+              <option value="mixed" disabled>Mixed / custom roads</option>
+              <option value="1">2 lanes (1 per direction)</option>
+              <option value="2" selected>4 lanes (2 per direction)</option>
+              <option value="3">6 lanes (3 per direction)</option>
+              <option value="4">8 lanes (4 per direction)</option>
+              <option value="5">10 lanes (5 per direction)</option>
+              <option value="6">12 lanes (6 per direction)</option>
+              <option value="7">14 lanes (7 per direction)</option>
+              <option value="8">16 lanes (8 per direction)</option>
+            </select>
+          </div>
           <div class="button-row">
             <button id="sample-grid">Add Sample Grid</button>
             <button id="clear-map" class="danger">Clear Map</button>
           </div>
+          <p class="hint">Scenario changes the map layout. Road lanes changes lane count on the roads.</p>
           <div id="weight-table" class="table-wrap"></div>
         </section>
 

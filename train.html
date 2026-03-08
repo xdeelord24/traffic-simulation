@@ -32,6 +32,12 @@
         background: rgba(8, 18, 29, 0.8);
         border: 1px solid rgba(107, 128, 149, 0.35);
       }
+      #reward-stats {
+        margin-top: 0.75rem;
+        font-size: 11px;
+        line-height: 1.45;
+        white-space: pre-wrap;
+      }
       #train-log {
         font-size: 11px;
         max-height: 220px;
@@ -61,27 +67,55 @@
           <div class="inline">
             <label>
               Episodes
-              <input id="episodes" type="number" min="1" step="1" value="40" />
+              <input id="episodes" type="number" min="1" step="1" value="48" />
             </label>
             <label>
               Update every
-              <input id="update-every" type="number" min="1" step="1" value="4" />
+              <input id="update-every" type="number" min="1" step="1" value="8" />
             </label>
           </div>
           <div class="inline">
             <label>
               Episode seconds
-              <input id="episode-seconds" type="number" min="30" step="30" value="180" />
+              <input id="episode-seconds" type="number" min="30" step="30" value="240" />
             </label>
             <label>
               UI refresh every steps
-              <input id="refresh-every" type="number" min="1" step="1" value="10" />
+              <input id="refresh-every" type="number" min="1" step="1" value="15" />
             </label>
           </div>
           <div class="inline">
             <label>
               Spawn rate / min
-              <input id="train-spawn-rate" type="number" min="0" max="120" step="1" value="120" />
+              <input id="train-spawn-rate" type="number" min="0" max="120" step="1" value="100" />
+            </label>
+          </div>
+          <div class="inline">
+            <label>
+              Scenario strategy
+              <select id="scenario-strategy">
+                <option value="cycle">Cycle selected scenarios</option>
+                <option value="focus" selected>Focus one scenario</option>
+                <option value="curriculum">Curriculum (easy to hard)</option>
+              </select>
+            </label>
+            <label>
+              Focus scenario
+              <select id="focus-scenario"></select>
+            </label>
+          </div>
+          <div class="inline">
+            <label>
+              Learning mode
+              <select id="learning-mode">
+                <option value="hybrid">Hybrid (imitation warm-start + RL)</option>
+                <option value="rl">RL only</option>
+                <option value="imitation">Imitation only</option>
+              </select>
+            </label>
+            <label>
+              Warmup episodes
+              <input id="warmup-episodes" type="number" min="0" step="1" value="24" />
             </label>
           </div>
           <div class="scenario-grid" id="scenario-grid"></div>
@@ -98,6 +132,7 @@
         <section class="group trainer-panel">
           <h2>Reward</h2>
           <canvas id="reward-chart" width="360" height="180"></canvas>
+          <pre id="reward-stats" class="stats"></pre>
         </section>
 
         <section class="group trainer-panel">
@@ -119,7 +154,12 @@
     <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs/dist/tf.min.js"></script>
     <script type="module" src="app.js"></script>
     <script type="module">
-      import { RLAgent, computeReward } from './rl-agent.js';
+      import {
+        RLAgent,
+        buildPressureFallbackDecisions,
+        buildTeacherActionIndices,
+        computeRewardBreakdown,
+      } from './rl-agent.js';
 
       const TRAINER_STORAGE_KEY = 'trainer';
       const MAIN_STORAGE_KEY = 'main';
@@ -136,6 +176,8 @@
 
       const agent = new RLAgent();
       const rewardHistory = [];
+      const rewardAverages = [];
+      let latestRewardStats = null;
       let training = false;
 
       const ui = {
@@ -144,6 +186,10 @@
         episodeSeconds: document.getElementById('episode-seconds'),
         refreshEvery: document.getElementById('refresh-every'),
         spawnRate: document.getElementById('train-spawn-rate'),
+        scenarioStrategy: document.getElementById('scenario-strategy'),
+        focusScenario: document.getElementById('focus-scenario'),
+        learningMode: document.getElementById('learning-mode'),
+        warmupEpisodes: document.getElementById('warmup-episodes'),
         start: document.getElementById('start-training'),
         stop: document.getElementById('stop-training'),
         save: document.getElementById('save-model'),
@@ -151,6 +197,7 @@
         export: document.getElementById('export-model'),
         status: document.getElementById('model-status'),
         chart: document.getElementById('reward-chart'),
+        rewardStats: document.getElementById('reward-stats'),
         log: document.getElementById('train-log'),
         scenarioGrid: document.getElementById('scenario-grid'),
       };
@@ -174,6 +221,29 @@
         ].join('');
       }
 
+      function renderFocusScenarioOptions() {
+        ui.focusScenario.innerHTML = SCENARIOS.map(
+          (scenario) =>
+            `<option value="${scenario.id}"${scenario.id === 'linear' ? ' selected' : ''}>${scenario.name}</option>`
+        ).join('');
+      }
+
+      function setSelectedScenarios(scenarioIds) {
+        const wanted = new Set(scenarioIds);
+        const boxes = Array.from(
+          ui.scenarioGrid.querySelectorAll('input[data-scenario]:not([data-scenario="all"])')
+        );
+        for (const box of boxes) {
+          if (box instanceof HTMLInputElement) {
+            box.checked = wanted.has(box.dataset.scenario);
+          }
+        }
+        const all = ui.scenarioGrid.querySelector('input[data-scenario="all"]');
+        if (all instanceof HTMLInputElement) {
+          all.checked = boxes.every((box) => box instanceof HTMLInputElement && box.checked);
+        }
+      }
+
       function selectedScenarioIds() {
         const all = ui.scenarioGrid.querySelector('input[data-scenario="all"]');
         if (all?.checked) {
@@ -185,6 +255,74 @@
         return checked.length ? checked : SCENARIOS.map((scenario) => scenario.id);
       }
 
+      function pickScenarioId(episodeIndex) {
+        const strategy = ui.scenarioStrategy.value || 'cycle';
+        const selected = selectedScenarioIds();
+        const focus = ui.focusScenario.value || selected[0] || SCENARIOS[0].id;
+        if (strategy === 'focus') {
+          return focus;
+        }
+        if (strategy === 'curriculum') {
+          const order = ['linear', 'cross', 'ring', 'diamond', 'star', 'bottleneck', 'grid3x3', 'grid4x4'];
+          const filtered = order.filter((id) => selected.includes(id));
+          return filtered[episodeIndex % Math.max(1, filtered.length)] || focus;
+        }
+        return selected[episodeIndex % Math.max(1, selected.length)] || focus;
+      }
+
+      function phaseLabelForEpisode(episodeIndex) {
+        const mode = ui.learningMode.value || 'hybrid';
+        const warmupEpisodes = Math.max(0, Number(ui.warmupEpisodes.value) || 0);
+        if (mode === 'imitation') return 'imitation';
+        if (mode === 'rl') return 'rl';
+        return episodeIndex < warmupEpisodes ? 'imitation' : 'rl';
+      }
+
+      function movingAverage(values, windowSize = 5) {
+        return values.map((_, index) => {
+          const start = Math.max(0, index - windowSize + 1);
+          const slice = values.slice(start, index + 1);
+          return slice.reduce((sum, value) => sum + value, 0) / Math.max(1, slice.length);
+        });
+      }
+
+      function createEmptyRewardTerms() {
+        return {
+          completed: 0,
+          speed: 0,
+          queue: 0,
+          queueGrowth: 0,
+          stopped: 0,
+          phaseSwitch: 0,
+          overlap: 0,
+          collision: 0,
+        };
+      }
+
+      function formatTerm(value) {
+        return `${value >= 0 ? '+' : ''}${value.toFixed(2)}`;
+      }
+
+      function renderRewardStats() {
+        if (!ui.rewardStats) return;
+        if (!latestRewardStats) {
+          ui.rewardStats.textContent = 'Run a training episode to see reward diagnostics.';
+          return;
+        }
+        const averageReward =
+          rewardHistory.reduce((sum, value) => sum + value, 0) / Math.max(1, rewardHistory.length);
+        const recentAverage = rewardAverages[rewardAverages.length - 1] || latestRewardStats.reward;
+        const t = latestRewardStats.terms;
+        ui.rewardStats.textContent = [
+          `episode ${latestRewardStats.episode} | ${latestRewardStats.phaseLabel} | ${latestRewardStats.scenarioId}`,
+          `reward=${latestRewardStats.reward.toFixed(2)} | avg5=${recentAverage.toFixed(2)} | avgAll=${averageReward.toFixed(2)}`,
+          `completed=${latestRewardStats.vehiclesCompleted} | queue=${latestRewardStats.queue.toFixed(1)} | stopped=${latestRewardStats.stoppedVehicles} | switches=${latestRewardStats.phaseChanges}`,
+          `reward terms`,
+          `  completed ${formatTerm(t.completed)} | speed ${formatTerm(t.speed)} | queue ${formatTerm(t.queue)} | growth ${formatTerm(t.queueGrowth)}`,
+          `  stopped ${formatTerm(t.stopped)} | switch ${formatTerm(t.phaseSwitch)} | overlap ${formatTerm(t.overlap)} | collision ${formatTerm(t.collision)}`,
+        ].join('\n');
+      }
+
       function drawRewardChart() {
         const ctx = ui.chart.getContext('2d');
         if (!ctx) return;
@@ -193,12 +331,23 @@
         ctx.fillRect(0, 0, ui.chart.width, ui.chart.height);
 
         if (rewardHistory.length === 0) return;
-        const min = Math.min(...rewardHistory);
-        const max = Math.max(...rewardHistory);
+        const min = Math.min(...rewardHistory, ...rewardAverages, 0);
+        const max = Math.max(...rewardHistory, ...rewardAverages, 0);
         const range = Math.max(1, max - min);
+        const zeroY =
+          ui.chart.height -
+          12 -
+          ((0 - min) / range) * (ui.chart.height - 24);
 
-        ctx.strokeStyle = 'rgba(173, 127, 255, 0.95)';
-        ctx.lineWidth = 2;
+        ctx.strokeStyle = 'rgba(110, 140, 170, 0.35)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(12, zeroY);
+        ctx.lineTo(ui.chart.width - 12, zeroY);
+        ctx.stroke();
+
+        ctx.strokeStyle = 'rgba(173, 127, 255, 0.65)';
+        ctx.lineWidth = 1.6;
         ctx.beginPath();
         rewardHistory.forEach((reward, index) => {
           const x = (index / Math.max(1, rewardHistory.length - 1)) * (ui.chart.width - 24) + 12;
@@ -211,14 +360,34 @@
         });
         ctx.stroke();
 
+        if (rewardAverages.length > 1) {
+          ctx.strokeStyle = 'rgba(92, 230, 214, 0.95)';
+          ctx.lineWidth = 2.4;
+          ctx.beginPath();
+          rewardAverages.forEach((reward, index) => {
+            const x = (index / Math.max(1, rewardAverages.length - 1)) * (ui.chart.width - 24) + 12;
+            const y =
+              ui.chart.height -
+              12 -
+              ((reward - min) / range) * (ui.chart.height - 24);
+            if (index === 0) ctx.moveTo(x, y);
+            else ctx.lineTo(x, y);
+          });
+          ctx.stroke();
+        }
+
         ctx.fillStyle = '#d7e3ee';
         ctx.font = '12px sans-serif';
         ctx.fillText(`Last reward: ${rewardHistory[rewardHistory.length - 1].toFixed(2)}`, 12, 18);
+        if (rewardAverages.length) {
+          ctx.fillStyle = '#86f0e0';
+          ctx.fillText(`Avg(5): ${rewardAverages[rewardAverages.length - 1].toFixed(2)}`, 12, 34);
+        }
       }
 
       async function runEpisode(episodeIndex) {
-        const chosen = selectedScenarioIds();
-        const scenarioId = chosen[episodeIndex % chosen.length];
+        const scenarioId = pickScenarioId(episodeIndex);
+        const phaseLabel = phaseLabelForEpisode(episodeIndex);
         const episodeSeconds = Math.max(30, Number(ui.episodeSeconds.value) || 180);
         const refreshEvery = Math.max(1, Number(ui.refreshEvery.value) || 10);
         const spawnRate = Math.max(0, Number(ui.spawnRate.value) || 120);
@@ -235,6 +404,7 @@
         agent.beginEpisode();
         let prevMetrics = window.getRewardMetrics();
         let totalReward = 0;
+        const rewardTerms = createEmptyRewardTerms();
 
         for (let step = 0; step < episodeSeconds; step += 1) {
           const snapshot = window.getTrafficSnapshot();
@@ -242,13 +412,30 @@
             eligibleMode: 'rl',
             deterministic: false,
           });
-          window.applyTrafficLightDecisions(decisions);
+
+          if (phaseLabel === 'imitation') {
+            const teacherDecisions = buildPressureFallbackDecisions(snapshot, 'rl');
+            const teacher = buildTeacherActionIndices(snapshot, {
+              eligibleMode: 'rl',
+              decisions: teacherDecisions,
+            });
+            agent.addImitationSample(transition, teacher.actionIndices);
+            window.applyTrafficLightDecisions(teacher.decisions);
+          } else {
+            window.applyTrafficLightDecisions(decisions);
+          }
           window.stepSimulation(1);
 
           const currMetrics = window.getRewardMetrics();
           const phaseChangeDelta = currMetrics.phaseChanges - prevMetrics.phaseChanges;
-          const reward = computeReward(prevMetrics, currMetrics, phaseChangeDelta);
-          agent.addTransition(transition, reward, step === episodeSeconds - 1);
+          const rewardBreakdown = computeRewardBreakdown(prevMetrics, currMetrics, phaseChangeDelta);
+          const reward = rewardBreakdown.total;
+          for (const [key, value] of Object.entries(rewardBreakdown.terms)) {
+            rewardTerms[key] += value;
+          }
+          if (phaseLabel === 'rl') {
+            agent.addTransition(transition, reward, step === episodeSeconds - 1);
+          }
           prevMetrics = currMetrics;
           totalReward += reward;
 
@@ -257,13 +444,19 @@
           }
         }
 
-        agent.finishEpisode(0);
+        if (phaseLabel === 'rl') {
+          agent.finishEpisode(0);
+        }
         window.clearBacktestSeed();
         return {
           scenarioId,
+          phaseLabel,
           reward: totalReward,
           vehiclesCompleted: prevMetrics.vehiclesCompleted,
           queue: prevMetrics.totalQueue,
+          stoppedVehicles: prevMetrics.stoppedVehicles,
+          phaseChanges: prevMetrics.phaseChanges,
+          rewardTerms,
         };
       }
 
@@ -278,21 +471,44 @@
         for (let episode = 0; episode < totalEpisodes && training; episode += 1) {
           const result = await runEpisode(episode);
           rewardHistory.push(result.reward);
+          rewardAverages.splice(0, rewardAverages.length, ...movingAverage(rewardHistory, 5));
+          latestRewardStats = {
+            episode: episode + 1,
+            scenarioId: result.scenarioId,
+            phaseLabel: result.phaseLabel,
+            reward: result.reward,
+            vehiclesCompleted: result.vehiclesCompleted,
+            queue: result.queue,
+            stoppedVehicles: result.stoppedVehicles,
+            phaseChanges: result.phaseChanges,
+            terms: { ...result.rewardTerms },
+          };
           drawRewardChart();
+          renderRewardStats();
 
-          let lossText = 'rollout buffered';
+          let lossText = result.phaseLabel === 'imitation' ? 'teacher samples buffered' : 'rollout buffered';
           if ((episode + 1) % updateEvery === 0) {
-            const metrics = await agent.update();
-            lossText = `loss=${metrics.loss.toFixed(3)} policy=${metrics.policyLoss.toFixed(3)} value=${metrics.valueLoss.toFixed(3)}`;
+            if (agent.imitationBuffer.length) {
+              const imitation = await agent.updateImitation();
+              lossText = `imitation=${imitation.imitationLoss.toFixed(3)} entropy=${imitation.entropy.toFixed(3)}`;
+            }
+            if (agent.rollout.length) {
+              const metrics = await agent.update();
+              lossText = `${lossText}; rl=${metrics.loss.toFixed(3)} policy=${metrics.policyLoss.toFixed(3)} value=${metrics.valueLoss.toFixed(3)}`;
+            }
           }
 
           log(
-            `Episode ${episode + 1}/${totalEpisodes} | scenario=${result.scenarioId} | reward=${result.reward.toFixed(2)} | completed=${result.vehiclesCompleted} | queue=${result.queue.toFixed(1)} | ${lossText}`
+            `Episode ${episode + 1}/${totalEpisodes} | phase=${result.phaseLabel} | scenario=${result.scenarioId} | reward=${result.reward.toFixed(2)} | avg5=${(rewardAverages[rewardAverages.length - 1] || result.reward).toFixed(2)} | completed=${result.vehiclesCompleted} | queue=${result.queue.toFixed(1)} | stopped=${result.stoppedVehicles} | switch=${result.phaseChanges} | terms c=${formatTerm(result.rewardTerms.completed)} q=${formatTerm(result.rewardTerms.queue + result.rewardTerms.queueGrowth)} sw=${formatTerm(result.rewardTerms.phaseSwitch)} | ${lossText}`
           );
           setStatus(`Episode ${episode + 1}/${totalEpisodes}`);
           await new Promise((resolve) => requestAnimationFrame(resolve));
         }
 
+        if (agent.imitationBuffer.length) {
+          const imitation = await agent.updateImitation();
+          log(`Final imitation update | loss=${imitation.imitationLoss.toFixed(3)} entropy=${imitation.entropy.toFixed(3)}`);
+        }
         if (agent.rollout.length) {
           const metrics = await agent.update();
           log(`Final update | loss=${metrics.loss.toFixed(3)} policy=${metrics.policyLoss.toFixed(3)} value=${metrics.valueLoss.toFixed(3)}`);
@@ -367,6 +583,9 @@
       });
 
       renderScenarioGrid();
+      renderFocusScenarioOptions();
+      setSelectedScenarios(['linear']);
+      renderRewardStats();
       drawRewardChart();
     </script>
   </body>

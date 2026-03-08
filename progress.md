@@ -48,6 +48,28 @@ Original prompt: Build a traffic simulation, that the user can add intersections
 - Fixed intersection U-turn behavior in boundary-spawn routing:
   - `shortestPath` now accepts an optional previous-node constraint for the start state.
   - Boundary spawn route generation now passes entry boundary node as the previous node, preventing immediate `A -> B -> A` reversal at the first interior intersection.
+- Improved visual continuity through intersections (straight/left/right crossing):
+  - Added cubic-bezier turn blending in `getVehicleWorldPose` when vehicles approach an intersection and have a next segment.
+  - Vehicles now render with continuous crossing motion through the node instead of abrupt segment-to-segment orientation changes.
+  - Vehicles still despawn when they reach route end.
+- Fixed intersection visibility and lane/speed instability issues:
+  - Render order changed so vehicles are drawn after intersections; cars remain visible while crossing signal nodes.
+  - Lane selection at intersections now uses lane preference and a strict lane-change limit (`MAX_LANE_CHANGE_PER_INTERSECTION = 0`) to prevent abrupt cross-lane “throwing”.
+  - Replaced hard speed clamps during blocked crossing with deceleration-limited hold speed (`applyIntersectionHoldSpeed`) to remove sudden vacuum-like speed snaps.
+  - Smoothed lane-separation speed correction to be deceleration-limited per tick instead of instant speed snapping.
+- Added full red/yellow/green signal behavior and stop-line logic:
+  - Signal switching now transitions via a yellow phase (`SIGNAL_YELLOW_DURATION`) before changing to the next green approach.
+  - Vehicles treat yellow as caution: close vehicles can clear, farther vehicles begin stopping before the stop line.
+  - Intersection hold position now uses a stop-line progress target (`getStopLineProgress`) to prevent vehicles from appearing stopped in the middle of nodes.
+  - Signal snapshots now include `signal.color` and `signal.pending_phase`.
+- Fixed intersection teleport/circling artifacts during crossing:
+  - Turn blend now starts only after stop-line threshold (`turnStartProgress >= stopLine + 0.03`) so waiting vehicles do not visually jump into the node when phases change.
+  - Turn blending no longer depends on dynamic lane-clear checks that can toggle frame-to-frame and cause visual snapping.
+  - Bezier control distances are capped by turn chord length to prevent over-curved paths that can appear as circling before lane exit.
+- Fixed committed-intersection behavior for red/yellow signals:
+  - Vehicles past the stop line are now treated as committed and continue clearing the current intersection regardless of signal color.
+  - Reservation blocking is ignored once a vehicle is committed to the current intersection, preventing red/yellow re-block after line crossing.
+  - Crossing checks now allow already-committed vehicles to finish entering/clearing the intersection on the same movement step.
 - Backtest improvements:
   - Seeded RNG (xorshift32) for reproducible runs; `setBacktestSeed` / `clearBacktestSeed` API.
   - Multiple trials (3) per scenario with averaged results for more stable comparison.
@@ -62,6 +84,12 @@ Original prompt: Build a traffic simulation, that the user can add intersections
   - Added reward APIs to `app.js`: `getRewardMetrics()` and `resetPhaseChangeCounter()`.
   - Added `train.html` for browser-based RL training, logging, reward charting, and exporting the trained model to the main app slot.
   - Added RL runtime loading to `index.html` and `backtest.html`, plus RL as a 4th comparison mode in backtest.
+- Improved RL training quality:
+  - Reward shaping now also uses average speed, queue growth, stopped-vehicle count, overlaps, and collision warnings.
+  - Observation/state was expanded from queue/flow/phase only to include wait ages, coordination bonuses, elapsed green time, and downstream occupancy context.
+  - `train.html` now supports scenario strategy selection (`cycle`, `focus`, `curriculum`) and focused single-scenario training.
+  - Added imitation-learning warm start from the pressure-based external teacher, including a hybrid mode that switches from imitation to RL after a configurable warmup.
+  - Fixed imitation targets so invalid initial phases are normalized to valid available approaches before supervised updates.
 
 ## Validation
 - Installed local Node dependencies in workspace (`playwright`) and Playwright browser binaries under `.playwright-browsers`.
@@ -105,6 +133,27 @@ Original prompt: Build a traffic simulation, that the user can add intersections
   - Run output: `output/web-game-no-uturn-check` (`8` captures, `300` frames each).
   - State scan across captures reported `NO_REVERSE_EDGE_TRANSITIONS_DETECTED` (no `A->B` then `B->A` transitions for the same vehicle).
   - No Playwright error file was produced for the run.
+- Intersection-crossing visual validation:
+  - Run output: `output/web-game-intersection-crossing` (`6` captures, `300` frames each).
+  - No Playwright error file was produced for the run.
+  - ID turnover check confirms end-of-route despawn behavior remained intact (`V1..V4` disappeared by final capture; newer IDs present).
+- Visibility + speed stability validation:
+  - Playwright output: `output/web-game-intersection-visibility-fix` and `output/web-game-visibility-speed-fix`; no Playwright error files were produced.
+  - Stress probe using `getDebugVehiclePoses` at `120` spawns/min for `75s` reports:
+    - `lane_jump_count: 0`
+    - `speed_delta_gt_8_count: 0`
+    - `max_speed_delta_per_frame: 2.13`
+- Yellow-phase / midpoint-stop validation:
+  - Playwright output: `output/web-game-yellow-phase-fix` (`8` captures, `300` frames each); no Playwright error file produced.
+  - Snapshot confirms yellow state appears in runtime (`signal.color: "yellow"` with `pending_phase`).
+  - State scan reports `NO_STOPPED_NEAR_CENTER_FOUND` for stopped vehicles near lane end (`progress >= 0.95`, `speed <= 1.0`).
+- Teleport/circling fix validation:
+  - Playwright output: `output/web-game-teleport-circling-fix` (`10` captures, `300` frames each); no Playwright error file produced.
+  - State scan reports `NO_LARGE_SAME_LANE_PROGRESS_JUMPS` (no abnormal same-lane progress jumps > `0.4` between captures).
+  - Screenshot inspection in later captures shows stable lane-following and no visible spin/circle artifacts at intersections.
+- Committed-intersection validation:
+  - Geometry/logic probe over `90s` reports `committed_visual_stop_count: 0` for vehicles beyond the visual commit threshold (`turnStartProgress`) on non-green signals.
+  - Playwright output: `output/web-game-committed-intersection-fix` (`4` captures, `300` frames each); no Playwright error file produced.
 - RL smoke validation:
   - Installed local Chromium with `npx playwright install chromium` after the Playwright client reported missing browser binaries.
   - Smoke runs saved to `output/rl-index-smoke`, `output/rl-backtest-smoke`, and `output/rl-train-smoke`.
@@ -112,9 +161,212 @@ Original prompt: Build a traffic simulation, that the user can add intersections
     - `train.html` renders controls for episodes, update cadence, scenario selection, reward chart, and export actions.
     - A short 1-episode / 30-second training run completed in-browser and logged reward/loss output.
     - Exporting the trained model removed the previous \"missing RL model\" fallback warning on fresh `index.html` / `backtest.html` loads.
+- RL improvement validation:
+  - Browser validation confirmed the new trainer controls render: scenario strategy, focus scenario, learning mode, and warmup episodes.
+  - A focused `linear` smoke run in hybrid mode completed with `phase=imitation` and a sane imitation loss (~`2.097`) instead of the previous exploded loss from invalid teacher targets.
+- Bottleneck collision-warning fix:
+  - Investigated bottleneck-specific warning spikes and confirmed they were caused by near-center spoke transitions being counted as overlaps even after the intersection reservation system had serialized them.
+  - Tightened destination-lane entry checks to require safe spacing around the inserted progress point, not just in front of it.
+  - Expanded the shared-intersection overlap clearance window in `countVehicleOverlaps()` to cover the full protected transition zone around a reserved intersection (`INTERSECTION_RESERVE_DISTANCE + SAFE_GAP`), matching the bottleneck scenario's spoke handoff geometry.
+- Bottleneck warning validation:
+  - Targeted Playwright-driven bottleneck run at `120` spawns/min for `180s` with seed `123456789`.
+  - Verified all three tested modes now finish with `overlapPairs: 0` and `collisionWarnings: 0`:
+    - `adaptive`: `vehiclesCompleted=166`
+    - `fixed`: `vehiclesCompleted=186`
+    - `external`: `vehiclesCompleted=187`
+- RL trainer diagnostics + stability defaults:
+  - Added `computeRewardBreakdown()` to `rl-agent.js` so training can inspect per-step reward terms instead of only the scalar total.
+  - Updated `train.html` to accumulate per-episode reward terms and surface them in a reward diagnostics panel.
+  - Added a smoothed `avg(5)` reward line on top of the raw reward chart to make trend direction easier to read.
+  - Tuned trainer defaults toward a steadier focused run: `focus` strategy by default, `linear` preselected, `48` episodes, update every `8`, `240s` episodes, `100` spawns/min, and `24` warmup episodes.
+- RL trainer validation:
+  - Playwright client smoke pass completed against `train.html` and produced fresh state artifacts in `output/rl-trainer-diag-smoke`.
+  - Browser validation confirmed the new placeholder text renders before training: `Run a training episode to see reward diagnostics.`
+  - Ran a short focused trainer session (`2` episodes, `30s`, update every `1`, warmup `1`) and confirmed the reward diagnostics panel updates with episode metrics and term breakdowns, e.g. `completed`, `queue`, `growth`, `stopped`, and `switch`.
+  - Confirmed the log now includes `avg5=...` and the chart shows both raw and smoothed reward traces.
+- Green-light stall fix:
+  - Investigated reports that vehicles sometimes remained stopped even while their approach was green.
+  - Found two reservation-side causes:
+    - vehicles that had already exited an intersection were still reserving it while moving away,
+    - the reservation owner was chosen purely by proximity, even when that vehicle could not clear into its downstream lane, starving another green vehicle that could.
+  - Updated `buildIntersectionReservations()` so approach-side reservations only go to vehicles that can actually clear the intersection this tick.
+  - Relaxed exit-side reservations so only slow just-exited vehicles keep blocking the intersection, preventing fast outbound traffic from needlessly holding a green approach.
+  - Kept the reverse-direction release-ignore safeguard so opposite-direction lane handoffs do not serialize unnecessarily.
+- Green-light stall validation:
+  - Targeted detector runs no longer found false long-duration green stalls; remaining green-side stops were downstream-blocked cases where `nextLaneAvailable` was false (real spillback).
+  - Playwright smoke run saved to `output/green-go-smoke`; snapshot progression shows vehicles spawning and moving with no overlaps.
+  - Regression metrics after the movement fix remained clean:
+    - `grid3x3` adaptive, `180s`, `120` spawns/min: `vehiclesCompleted=244`, `overlapPairs=0`, `collisionWarnings=0`
+    - `bottleneck` adaptive, `180s`, `120` spawns/min: `vehiclesCompleted=171`, `overlapPairs=0`, `collisionWarnings=0`
+- Vehicle disappearance hardening:
+  - Investigated reports that vehicles sometimes vanished while crossing intersections instead of reappearing on the next segment.
+  - Found a silent-drop path in `updateVehicles()`: if `getVehicleSegment(vehicle)` returned `null`, the vehicle was skipped for that tick and never added back to survivors.
+  - Added `rerouteVehicleFromNode()` to repair a vehicle's remaining route from the current intersection to its destination if the next hop becomes invalid.
+  - Updated `updateVehicles()` to:
+    - repair invalid current segments instead of silently dropping the vehicle,
+    - attempt route repair when a handoff reaches an intersection whose planned next road is missing,
+    - only mark the vehicle completed when it has actually reached its destination node.
+- Vehicle disappearance validation:
+  - Ran a multi-scenario detector (`grid3x3`, `grid4x4`, `linear`, `cross`, `star`, `diamond`, `bottleneck`, `ring`) looking for vehicles that disappeared without a matching `vehiclesCompleted` increment; no findings were reported.
+  - Playwright smoke run saved to `output/vehicle-missing-smoke`; latest snapshot shows active vehicles continuing on-road and no overlap/collision regression.
+- Collision warning fix:
+  - Investigated renewed `collisionWarnings` spikes after the recent movement/reservation changes and confirmed they were mostly false positives near shared intersections, not sustained physical overlaps.
+  - Found a bug in `sharedIntersectionClearance()`: it only checked the first shared node between two segments, which failed for same-road / same-junction cases where the relevant shared node was the other endpoint.
+  - Updated the clearance logic to evaluate all shared intersection IDs and treat vehicles inside the full reserve-to-release handoff zone as safe serialized movement.
+  - Final protected clearance radius now explicitly covers the intersection reserve distance plus the release distance (`INTERSECTION_RESERVE_DISTANCE + INTERSECTION_RELEASE_DISTANCE + 2`), matching the current handoff geometry.
+- Collision warning validation:
+  - Full seeded regression sweep across `grid3x3`, `grid4x4`, `linear`, `cross`, `star`, `diamond`, `bottleneck`, and `ring` for `adaptive`, `fixed`, and `external` modes at `120` spawns/min for `180s` reported no remaining rows with `collisionWarnings > 0` or `overlapPairs > 0`.
+  - Playwright smoke run saved to `output/collision-fix-smoke`; latest snapshot/state shows normal vehicle motion with `collision_warning_ticks: 0` and `overlap_pairs: 0`.
+- Mixed vehicle variants + orientation update:
+  - Replaced the single fixed car footprint with weighted vehicle profiles (`motorcycle`, `compact`, `sedan`, `van`, `truck`) so spawned traffic now varies by size, spacing, acceleration/braking feel, and top speed.
+  - Updated lane-entry, lane-gap, intersection-release, and overlap checks to use per-vehicle dimensions instead of one global `VEHICLE_LENGTH` / `SAFE_GAP` assumption.
+  - Added live vehicle mix reporting to the stats panel and included per-vehicle type/size metadata in `render_game_to_text()`.
+  - Changed vehicle rendering from rectangles to forward-pointing triangles so direction/orientation is readable at a glance.
+- Mixed vehicle validation:
+  - Browser visual check on `index.html` confirmed multiple triangle vehicles render with clearly visible forward orientation.
+  - Playwright capture run saved to `output/vehicle-variant-check-live`; latest snapshot (`state-2.json`) shows mixed active vehicle types (`van`, `sedan`) with `overlap_pairs: 0` and `collision_warning_ticks: 0`.
+- Global traffic-light AI control:
+  - Added a panel-level selector in `index.html` so users can choose one traffic-light mode for every intersection without opening the inspector for each node.
+  - Added shared signal-mode helpers in `app.js` so individual intersection changes and global changes both use the same reset/sync behavior.
+  - The new global selector now reflects mixed per-intersection settings via a disabled `Mixed / per intersection` option, and snaps back to a concrete mode when all intersections match.
+- Global traffic-light validation:
+  - Browser check confirmed the new `Traffic light AI for all intersections` selector renders in the Simulation section and updates visually when changed.
+  - Playwright smoke capture saved to `output/global-signal-mode-smoke`.
+  - Targeted Playwright state check selected `fixed` in `#global-signal-mode` and verified every intersection reported `signal.mode: "fixed"` (`{"ok":true,"intersections":9,"mode":"fixed"}`).
+- Road-entry speed handoff fix:
+  - Investigated reports that vehicles visibly sped up only after they had already crossed into the next road segment.
+  - Added `getVehicleCarryThroughSpeed()` in `app.js` and now apply it during segment handoff inside `updateVehicles()` so a vehicle keeps through-movement speed across the intersection instead of re-accelerating on the new road.
+  - The handoff speed is capped by the slower of the origin and destination road targets, so the fix does not overshoot the next road's speed limit.
+- Road-entry speed validation:
+  - `node --check app.js` passed after the movement change.
+  - Deterministic browser probe on `grid3x3` at `90` spawns/min over `90s` reported `transition_count: 174` and `avg_entry_speed: 52.118`, up from the previous probe's `45.893`, with `low_entry_count: 0`.
+  - Required Playwright client smoke run saved to `output/web-game-road-entry-speed-fix`; latest screenshot/state showed normal rendering and produced no separate error artifact.
+- Multi-lane utilization + collision detection pass:
+  - Increased lane geometry to match mixed vehicle widths (`LANE_WIDTH`, `ROAD_LANE_SPACING`, and `INTERSECTION_RADIUS`) so 4-lane roads have enough physical room for parallel traffic.
+  - Reworked `pickLaneWithSpace()` to score clear entry lanes by forward space and current lane load instead of defaulting to the same lane bias, which lets vehicles use open lanes on wide roads.
+  - Added `lane_index` to the traffic snapshot so lane usage can be verified through the exported API.
+  - Replaced the old center-distance collision warning with body-shape overlap checks based on the rendered triangle footprint.
+  - Added narrow collision-warning exemptions for known safe geometries only: same-lane serialized intersection release, separated parallel lanes on the same directed segment, separated opposing approaches on the same straight corridor, and the one-tick same-lane exit-tail handoff.
+  - Tightened intersection movement by separating stop-line distance from commit distance and requiring node reservation ownership at the actual intersection-entry step, even for already-committed vehicles.
+- Multi-lane / collision validation:
+  - `node --check app.js` passed after the lane and collision updates.
+  - Deterministic `grid3x3` stress probe (`120` spawns/min, `120s`, all signals `adaptive`) now shows both lanes being used across many active directions via `lane_index` in the snapshot.
+  - Latest stress probe still reports a rare residual overlap warning pattern under heavy load (`maxOverlapPairs: 1`, final `overlap_pairs: 0`, `collision_warning_ticks: 143`), isolated to a same-lane node handoff edge case rather than broad lane or intersection failures.
+  - Required Playwright client smoke run saved to `output/web-game-lane-collision-fix`; latest UI artifact (`state-2.json`) reports `overlap_pairs: 0`, `collision_warning_ticks: 0`, and shows active vehicles occupying both lane indices on the same inbound road to `I5`.
+- Vehicle turn indicators:
+  - Added `getVehicleTurnIntent()` in `app.js` to classify the next planned movement as `left`, `right`, or `straight` from the current segment and next segment.
+  - Updated vehicle rendering to show a visible on-body turn marker so users can tell whether a vehicle plans to turn left, turn right, or continue straight.
+  - Added `turn_intent` to each exported vehicle entry in `render_game_to_text()` so automation and debugging can inspect the same intent data the renderer uses.
+- Vehicle turn indicator validation:
+  - `node --check app.js` passed and no linter errors were reported.
+  - Targeted Playwright state probe at `90` spawns/min over `45s` reported active vehicle intents `["left","right","straight"]`.
+  - Motion capture saved to `output/turn-indicator-check`; latest screenshot (`shot-2.png`) showed readable straight and right-turn indicators on live vehicles, with `overlap_pairs: 0` and `collision_warning_ticks: 0` in `state-2.json`.
+- Brake lights:
+  - Added per-vehicle `brakeLightOn` state in `app.js`, driven by active deceleration, gap-limited slowing, or intersection stopping.
+  - Updated vehicle rendering to draw rear brake lights so braking vehicles are visually distinct from free-moving traffic.
+  - Added `brake_light_on` to each vehicle entry in `render_game_to_text()` so the exported snapshot matches the on-screen brake-light behavior.
+- Brake light validation:
+  - `node --check app.js` passed and no linter errors were reported.
+  - Targeted Playwright state probe at `90` spawns/min over `45s` found active braking vehicles in the exported snapshot (`{"total":26,"braking":19,...}`).
+  - Motion capture saved to `output/brake-light-check`; latest screenshot (`shot-2.png`) showed visible red rear lights on stopped/slowing vehicles, with `overlap_pairs: 0` and `collision_warning_ticks: 0` in `state-2.json`.
+- Intersection crossing speed carry fix:
+  - Investigated reports that vehicles still visibly slowed while inside the intersection and only returned to road speed after fully exiting the node.
+  - Added `getIntersectionExitProgress()` plus per-vehicle carry state (`intersectionCarrySpeed`, `intersectionCarryUntilProgress`) so speed carry now lasts through the full visible turn-exit window instead of only the single handoff frame.
+  - Updated `updateVehicles()` so the immediate post-handoff segment skips normal lane-gap speed clamping until the vehicle has cleared that exit-blend window, while still preserving stop-line logic for the next intersection.
+  - `getVehicleWorldPose()` now uses the same exit-progress helper, so the visual crossing window and the movement carry window stay aligned.
+- Intersection crossing speed validation:
+  - `node --check app.js` passed after the carry-window update.
+  - Focused crossing probe on `grid3x3` (`120` spawns/min, `120s`, `adaptive`) reduced measured speed dip during the post-handoff exit window from `avg_dip: 0.630` / `dip_over_3: 9` / `dip_over_6: 7` to `avg_dip: 0.248` / `dip_over_3: 3` / `dip_over_6: 3`.
+  - Required Playwright client smoke run saved to `output/web-game-intersection-speed-carry-fix`; latest UI artifact (`state-2.json`) reports `overlap_pairs: 0` and `collision_warning_ticks: 0`.
+- Scenario lane control:
+  - Added a `Scenario lanes` selector to the Network panel in `index.html`.
+  - Added a shared road-lane default in `app.js` so changing the selector updates all current roads and also becomes the default lane count for newly created roads and rebuilt scenarios.
+  - Added sync logic so the selector shows `Mixed / custom roads` when road lane counts differ after per-road edits.
+  - Exposed `window.setAllRoadLanes()` for automation and bulk updates.
+- Scenario lane validation:
+  - `node --check app.js` passed and no linter errors were reported.
+  - Browser check confirmed the new `Scenario lanes` selector renders and visually widens the current map when changed to `8 lanes (4 per direction)`.
+  - Targeted Playwright state check selected `4` in `#scenario-lanes` and verified both the current roads and a rebuilt `grid3x3` scenario all reported `lanes: 4` (`{"currentRoads":12,"allCurrent":true,"allRebuilt":true,"laneSet":[4]}`).
+  - Required Playwright smoke capture saved to `output/scenario-lanes-smoke`.
+- Turn-lane compliance + imperfect lane discipline:
+  - Added route-aware turn classification by segment index so lane selection can reason about the turn at the end of the segment being entered, not just the current segment.
+  - Tightened `pickLaneWithSpace()` so left turns reserve the leftmost approach lane and right turns reserve the rightmost approach lane whenever a valid turn lane exists.
+  - Added light per-vehicle lane-discipline variation (`laneStyle`, `laneDriftOffsetPx`) so some vehicles render slightly off-center in their lane for a more realistic look without abandoning turn-lane rules.
+  - Updated segment pose generation to include the vehicle’s lateral drift and exported `lane_style` / `lane_drift_px` in `render_game_to_text()`.
+- Turn-lane / lane-discipline validation:
+  - `node --check app.js` passed and no linter errors were reported.
+  - Targeted Playwright state probe at `90` spawns/min over `75s` reported `leftBadCount: 0`, `rightBadCount: 0`, and still found `looseCount: 7` vehicles showing the new imperfect lane-discipline behavior.
+  - Required Playwright smoke capture saved to `output/turn-lane-smoke`.
+  - Browser screenshot check (`turn-lanes-live.png`) confirmed visible off-center driving while turn indicators and braking lights remained readable.
+- Scenario control label fix:
+  - Corrected the earlier misunderstanding by splitting the Network controls into `Scenario` (topology preset) and `Road lanes` (literal lane count).
+  - Added a new scenario preset selector with `Sample Grid`, `3x3 Grid`, `4x4 Grid`, `Linear`, `Cross`, `Star`, `Diamond`, `Bottleneck`, and `Ring`.
+  - Wired the scenario selector so changing it rebuilds the current map with the chosen topology while preserving the separately selected road-lane default.
+  - Kept the previous lane-count feature, but relabeled it to `Road lanes` so its meaning is explicit.
+- Scenario control validation:
+  - `node --check app.js` passed and no linter errors were reported.
+  - Browser check confirmed the Network panel now shows distinct `Scenario` and `Road lanes` controls.
+  - Targeted Playwright state check verified that selecting `grid4x4` produced `16` intersections / `24` roads, then selecting `cross` produced `5` intersections / `4` roads, while the separately chosen lane count still persisted (`laneSet: [3]`).
+  - Required Playwright smoke capture saved to `output/scenario-preset-fix-smoke`.
+- Scenario preset uniqueness fix:
+  - Updated the `Star` preset so it is no longer identical to `Cross`; it now builds an eight-spoke layout with diagonal connections from the center.
+  - Targeted Playwright snapshot check confirmed `cross` now builds `5` intersections / `4` roads, while `star` builds `9` intersections / `8` roads with distinct diagonal spokes.
 
 ## TODO
 - Optional: add persistence (save/load network JSON) if needed for larger experiments.
 - Optional: expose richer per-lane congestion metrics (wait time, throughput) for AI training signals.
 - Optional: improve the PPO implementation with minibatches / GAE tuning if training quality becomes unstable.
 - Optional: remove `C:\Users\jundee\.codex\skills\develop-web-game\node_modules` junction if no longer needed.
+- Lane-full collision warning fix:
+  - Tightened lane admission so a vehicle only enters an outbound lane when there is enough forward gap to clear the full visual intersection release envelope, not just the lane entry point.
+  - Extended exit-side intersection reservation to hold ownership until the vehicle body fully clears the node, regardless of whether it is still moving quickly.
+  - Removed lateral lane drift (`lane_drift_px = 0`) so opposing-direction traffic stays centered in its lane group and does not produce road-body overlap warnings.
+  - Added a short all-red clearance after yellow and delayed the next green until the node is physically clear, preventing cross-traffic from being released while a previous movement is still clearing the intersection.
+  - Added one-tick reservation lookahead so conflicting approaches cannot both step past the stop line in the same simulation frame before reservations refresh.
+  - Narrowed overlap warning exemptions to serialized turn handoffs, opposing separated approaches, and same-lane stop-line tail geometry so false positives do not mask the real lane-full admission issue.
+- Lane-full collision validation:
+  - `node --check app.js` passed after the lane admission, reservation, and signal-clearance changes.
+  - Seeded Playwright stress probe (`120` spawns/min, `adaptive`, seeds `2..10`, `480` steps each) now reports `first: null` for every tested seed.
+  - Required Playwright client smoke run saved to `output/web-game-lane-admission-clearance-fix`; latest artifact `state-2.json` reports `overlap_pairs: 0` and `collision_warning_ticks: 0`, and `shot-2.png` visually shows queued traffic without body overlap warnings.
+- Spawn-on-full-lane collision fix:
+  - Replaced the old segment-level `isSpawnLaneBlocked()` check with lane-aware spawn planning.
+  - Added `buildSpawnCandidateVehicle()` and `planSpawnPlacement()` so spawn now computes the exact entry progress and exact lane before creating the live vehicle.
+  - If `pickLaneWithSpace(...)` returns `-1`, the vehicle is no longer spawned; this fixes the previous bug where a failed lane pick still spawned into lane `0`.
+- Spawn validation:
+  - `node --check app.js` passed after the spawn gate update.
+  - Deterministic Playwright stress probe at `240` spawns/min, `adaptive`, seeds `1..10`, `720` steps each found `firstOverlap: null` for every tested seed.
+  - Required Playwright client smoke run saved to `output/web-game-spawn-lane-full-fix`; latest artifact `state-2.json` reports `overlap_pairs: 0` and `collision_warning_ticks: 0`.
+- All-red deadlock / stuck-red signal fix:
+  - Investigated reports that several intersections could remain in `signal.color = red` indefinitely under congestion after the new all-red clearance logic.
+  - Root cause: the phase switch waited for the intersection to become physically clear, but queued vehicles at the stop line and blocked committed vehicles could keep the signal in all-red for tens of seconds.
+  - Updated approach reservations so committed vehicles keep owning the intersection even if their downstream lane becomes unavailable during handoff.
+  - Updated signal switching so the all-red state lasts only for `SIGNAL_ALL_RED_DURATION`; after that the light switches to the next phase and the reservation system blocks conflicting traffic until the intersection is actually free.
+- Stuck-red validation:
+  - `node --check app.js` passed after the signal reservation update.
+  - Targeted Playwright red-state probe no longer shows long-lived all-red states; latest captured red windows stay around `0.0s` to `0.65s` instead of growing to `20s+` / `60s+`.
+  - Overlap regression remained clean after the signal update: deterministic probes at `120` spawns/min (seeds `2..10`, `480` steps) and `240` spawns/min (seeds `1..5`, `480` steps) all reported `firstOverlap: null`.
+  - Required Playwright client smoke run saved to `output/web-game-signal-red-fix`; latest artifact `state-2.json` reports `overlap_pairs: 0`, `collision_warning_ticks: 0`, and mixed `green/yellow/red` signal states rather than permanent all-red nodes.
+- Straight-through path fix:
+  - Updated `shortestPath()` tie-breaking so equal-distance routes prefer fewer turns and better alignment toward the destination, instead of relying on arbitrary neighbor order.
+  - Updated `getVehicleWorldPose()` so when the current segment and next segment are truly straight-through, the vehicle uses a linear crossing path instead of the generic bezier turn interpolation.
+  - This keeps vehicles visually and behaviorally straight when their route is straight.
+- Straight-through validation:
+  - `node --check app.js` passed after the path and render updates.
+  - Deterministic overlap regression at `120` spawns/min (seeds `2..10`, `480` steps) remained clean with `firstOverlap: null` for every tested seed.
+  - Required Playwright client smoke run saved to `output/web-game-straight-path-fix`; latest artifact `state-2.json` reports `overlap_pairs: 0` and `collision_warning_ticks: 0`.
+- Heavy-traffic lag reduction:
+  - Investigated slowdown under high vehicle counts and confirmed the overlap diagnostic pass was still running every simulation tick, even though it only feeds warnings/stats and not the movement rules themselves.
+  - Added adaptive overlap-check sampling in `updateVehicles()`: the expensive `countVehicleOverlaps()` pass now runs less often as active vehicle count rises, while the main vehicle update / reservation / signal logic still runs every tick.
+  - Kept overlap state resets wired into `clearVehicles()` / `clearMap()` so warnings do not linger across resets.
+- Heavy-traffic validation:
+  - `node --check app.js` passed and no linter errors were reported after the performance change.
+  - Targeted Playwright benchmark on `grid4x4` at `240` spawns/min measured `window.stepSimulation(60)` at about `12918ms` and `window.stepSimulation(120)` at about `39887ms`, a clear improvement over the slower intermediate runs while keeping `overlapPairs: 0` and `collisionWarnings: 0`.
+  - Required Playwright client smoke run completed against `http://localhost:3456`; latest `output/web-game/state-2.json` still shows the simulation progressing normally with live traffic and no overlap/collision warnings.
+- Full-lane mobility fix:
+  - Added planned outbound lane selection for each vehicle so intersection reservation, rendering, and the actual road handoff all use the same target lane.
+  - Straight-through traffic can now shift by one lane at an intersection when its current outbound lane is full, instead of freezing at the stop line even when an adjacent straight lane is open.
+  - Scaled stop-line, commit, reserve, and exit-clearance distances by road width so 4-lane-per-direction intersections keep enough physical clearance and do not trigger false overlap warnings from undersized node geometry.
+- Full-lane mobility validation:
+  - `node --check app.js` passed after the lane-planning and multi-lane intersection-clearance updates.
+  - Deterministic 4-lane probe on `grid3x3` (`120` spawns/min, seed `7`, `36s`) reported `maxOverlapPairs: 0`, `maxCollisionWarningTicks: 0`, `straightLaneShiftTransitions: 10`, and `segmentHandoffs: 42`.
+  - Required Playwright client smoke run saved to `output/web-game-full-lane-mobility-fix`; latest artifact `state-2.json` reports `overlap_pairs: 0` and `collision_warning_ticks: 0`.

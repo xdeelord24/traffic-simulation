@@ -12,10 +12,13 @@ const ui = {
   clearTraffic: document.getElementById('clear-traffic'),
   clearMap: document.getElementById('clear-map'),
   sampleGrid: document.getElementById('sample-grid'),
+  scenarioPreset: document.getElementById('scenario-preset'),
+  scenarioLanes: document.getElementById('scenario-lanes'),
   spawnMode: document.getElementById('spawn-mode'),
   spawnRate: document.getElementById('spawn-rate'),
   spawnRateValue: document.getElementById('spawn-rate-value'),
   autoSpawn: document.getElementById('auto-spawn'),
+  globalSignalMode: document.getElementById('global-signal-mode'),
   stats: document.getElementById('stats'),
   inspector: document.getElementById('inspector'),
   weightTable: document.getElementById('weight-table'),
@@ -23,24 +26,98 @@ const ui = {
   appShell: document.getElementById('app-shell'),
 };
 
-const INTERSECTION_RADIUS = 16;
+const INTERSECTION_RADIUS = 20;
 const ROAD_WIDTH = 16;
 const LANE_OFFSET = 5;
-const LANE_WIDTH = 6; // Spacing between lane centers (vehicle width = 6)
-const ROAD_LANE_SPACING = 11; // Road width growth per extra lane (drawing)
-const VEHICLE_LENGTH = 12;
-const SAFE_GAP = 11;
+const LANE_WIDTH = 9; // Center spacing between adjacent lanes per direction.
+const ROAD_LANE_SPACING = 18; // Visual road width growth per extra lane per direction.
+const DEFAULT_VEHICLE_LENGTH = 12;
+const DEFAULT_VEHICLE_WIDTH = 6;
+const DEFAULT_SAFE_GAP = 11;
+const VEHICLE_PROFILES = [
+  {
+    id: 'motorcycle',
+    label: 'Motorcycle',
+    length: 8,
+    width: 4,
+    safeGap: 8,
+    speedFactor: 1.2,
+    accelerationFactor: 1.2,
+    brakingFactor: 0.95,
+    spawnWeight: 1.4,
+    color: '#7bdff2',
+  },
+  {
+    id: 'compact',
+    label: 'Compact',
+    length: 10,
+    width: 5,
+    safeGap: 9,
+    speedFactor: 1.08,
+    accelerationFactor: 1.05,
+    brakingFactor: 1,
+    spawnWeight: 1.2,
+    color: '#8ecae6',
+  },
+  {
+    id: 'sedan',
+    label: 'Sedan',
+    length: 12,
+    width: 6,
+    safeGap: 11,
+    speedFactor: 1,
+    accelerationFactor: 1,
+    brakingFactor: 1,
+    spawnWeight: 1.9,
+    color: '#ffb703',
+  },
+  {
+    id: 'van',
+    label: 'Van',
+    length: 14,
+    width: 7,
+    safeGap: 12,
+    speedFactor: 0.9,
+    accelerationFactor: 0.9,
+    brakingFactor: 1.05,
+    spawnWeight: 1,
+    color: '#90be6d',
+  },
+  {
+    id: 'truck',
+    label: 'Truck',
+    length: 17,
+    width: 8,
+    safeGap: 15,
+    speedFactor: 0.76,
+    accelerationFactor: 0.72,
+    brakingFactor: 1.12,
+    spawnWeight: 0.8,
+    color: '#f9844a',
+  },
+];
+const AVERAGE_VEHICLE_SPACING =
+  VEHICLE_PROFILES.reduce(
+    (sum, profile) => sum + (profile.length + profile.safeGap) * (profile.spawnWeight ?? 1),
+    0
+  ) /
+  VEHICLE_PROFILES.reduce((sum, profile) => sum + (profile.spawnWeight ?? 1), 0);
 const STOP_BUFFER = 17;
 const ACCELERATION = 42;
 const DECELERATION = 64;
 const INTERSECTION_RESERVE_DISTANCE = 28;
 const INTERSECTION_HOLD_SPEED = 8;
-const INTERSECTION_RELEASE_DISTANCE = VEHICLE_LENGTH + SAFE_GAP;
+const INTERSECTION_EXIT_HOLD_SPEED = 16;
 const COLLISION_DISTANCE = 4;
 const PRE_INTERSECTION_PROGRESS = 0.999;
 const AGENT_INTERVAL_SECONDS = 1.0;
 const FIXED_DT = 1 / 60;
 const APPROACH_ORDER = ['N', 'E', 'S', 'W'];
+const TURN_BLEND_MIN_PROGRESS = 0.72;
+const TURN_CONTROL_MIN_DISTANCE = 12;
+const TURN_CONTROL_MAX_DISTANCE = 36;
+const MAX_LANE_CHANGE_PER_INTERSECTION = 0;
+const MAX_STRAIGHT_LANE_CHANGE_PER_INTERSECTION = 1;
 const ADAPTIVE_QUEUE_WEIGHT = 2.8;
 const ADAPTIVE_FLOW_WEIGHT = 1.2;
 const ADAPTIVE_WAIT_AGE_WEIGHT = 0.5;
@@ -49,8 +126,13 @@ const ADAPTIVE_SWITCH_MARGIN_RATIO = 1.25;
 const ADAPTIVE_DRY_LANE_THRESHOLD = 0.3;
 const ADAPTIVE_STARVATION_SECONDS = 6;
 const ADAPTIVE_COORDINATION_BONUS = 0.8;
-
-const palette = ['#8ecae6', '#ffb703', '#fb8500', '#90be6d', '#f9844a'];
+const SIGNAL_YELLOW_DURATION = 1.4;
+const SIGNAL_ALL_RED_DURATION = 0.7;
+const YELLOW_CLEARANCE_DISTANCE = STOP_BUFFER + 6;
+const SIGNAL_MODE_VALUES = ['none', 'adaptive', 'fixed', 'external', 'rl'];
+const MIN_VIEW_ZOOM = 0.45;
+const MAX_VIEW_ZOOM = 2.8;
+const ZOOM_SENSITIVITY = 0.0015;
 
 const state = {
   mode: 'add-intersection',
@@ -70,6 +152,7 @@ const state = {
   nextIntersectionId: 1,
   nextRoadId: 1,
   nextVehicleId: 1,
+  defaultRoadLanes: 2,
   lastQueueMetrics: new Map(),
   lastFlowMetrics: new Map(),
   lastOverlapPairs: 0,
@@ -82,6 +165,12 @@ const state = {
   phaseChangeCount: 0,
   backtestSeed: null,
   currentScenarioId: null,
+  view: { x: 0, y: 0, zoom: 1 },
+  dragPointerMode: null,
+  dragPanLastScreen: null,
+  dragPanMoved: false,
+  dragPanAllowsDeselect: false,
+  overlapCheckCounter: 0,
 };
 
 function seededRandom() {
@@ -103,6 +192,337 @@ function round(value, digits = 2) {
   return Math.round(value * scale) / scale;
 }
 
+function getVehicleProfile(typeId) {
+  return VEHICLE_PROFILES.find((profile) => profile.id === typeId) || VEHICLE_PROFILES[2];
+}
+
+function resolveVehicleProfile(profile) {
+  if (!profile) return pickVehicleProfile();
+  if (typeof profile === 'string') return getVehicleProfile(profile);
+  return getVehicleProfile(profile.id);
+}
+
+function pickVehicleProfile() {
+  return pickByWeight(VEHICLE_PROFILES, (profile) => profile.spawnWeight ?? 1) || VEHICLE_PROFILES[0];
+}
+
+function getVehicleLength(vehicle) {
+  const value = Number(vehicle?.length);
+  return Number.isFinite(value) && value > 0 ? value : DEFAULT_VEHICLE_LENGTH;
+}
+
+function getVehicleWidth(vehicle) {
+  const value = Number(vehicle?.width);
+  return Number.isFinite(value) && value > 0 ? value : DEFAULT_VEHICLE_WIDTH;
+}
+
+function getVehicleSafeGap(vehicle) {
+  const value = Number(vehicle?.safeGap);
+  return Number.isFinite(value) && value >= 0 ? value : DEFAULT_SAFE_GAP;
+}
+
+function getVehicleReleaseDistance(vehicle) {
+  return getVehicleLength(vehicle) + getVehicleSafeGap(vehicle);
+}
+
+function getVehicleBodyClearance(a, b) {
+  return getVehicleLength(a) * 0.5 + getVehicleLength(b) * 0.5;
+}
+
+function getVehicleSpacingDistance(lead, follower) {
+  return getVehicleBodyClearance(lead, follower) + Math.max(getVehicleSafeGap(lead), getVehicleSafeGap(follower));
+}
+
+function getVehicleTargetRoadSpeed(vehicle, road) {
+  const speedFactor = Number(vehicle?.speedFactor);
+  const scale = Number.isFinite(speedFactor) && speedFactor > 0 ? speedFactor : 1;
+  return (road?.speedLimit ?? 0) * scale;
+}
+
+function getVehicleCarryThroughSpeed(vehicle, fromRoad, toRoad) {
+  const fromTargetSpeed = getVehicleTargetRoadSpeed(vehicle, fromRoad);
+  const toTargetSpeed = getVehicleTargetRoadSpeed(vehicle, toRoad);
+  if (toTargetSpeed <= 0) {
+    return fromTargetSpeed;
+  }
+  return Math.min(fromTargetSpeed, toTargetSpeed);
+}
+
+function getIntersectionExitProgress(segment, vehicle) {
+  if (!segment) return 0.3;
+  const clearanceDistance = Math.max(
+    getVehicleReleaseDistance(vehicle),
+    getIntersectionControlRadius(segment) + getVehicleLength(vehicle) * 0.5 + 2
+  );
+  return clamp(
+    clearanceDistance / Math.max(1, segment.length),
+    0.08,
+    0.42
+  );
+}
+
+function getIntersectionReleaseDistance(segment, vehicle) {
+  if (!segment) return getVehicleReleaseDistance(vehicle);
+  return Math.max(
+    getVehicleReleaseDistance(vehicle),
+    segment.length * getIntersectionExitProgress(segment, vehicle)
+  );
+}
+
+function buildVehicleMixSummary() {
+  const counts = new Map();
+  for (const vehicle of state.vehicles) {
+    const profile = getVehicleProfile(vehicle.type);
+    counts.set(profile.label, (counts.get(profile.label) || 0) + 1);
+  }
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .map(([label, count]) => `${label}:${count}`)
+    .join(', ');
+}
+
+function getVehicleNextSegment(vehicle) {
+  if (!vehicle) return null;
+  const nextStartId = vehicle.route[vehicle.segmentIndex + 1];
+  const nextEndId = vehicle.route[vehicle.segmentIndex + 2];
+  if (!nextStartId || !nextEndId) return null;
+  return getSegmentFromIds(nextStartId, nextEndId);
+}
+
+function getVehicleTurnIntent(vehicle) {
+  return getVehicleTurnIntentForRouteIndex(vehicle, vehicle?.segmentIndex ?? 0);
+}
+
+function getVehicleTurnIntentForRouteIndex(vehicle, routeSegmentIndex = 0) {
+  if (!vehicle) return 'straight';
+  const startId = vehicle.route?.[routeSegmentIndex];
+  const midId = vehicle.route?.[routeSegmentIndex + 1];
+  const endId = vehicle.route?.[routeSegmentIndex + 2];
+  if (!startId || !midId || !endId) return 'straight';
+
+  const segment = getSegmentFromIds(startId, midId);
+  const nextSegment = getSegmentFromIds(midId, endId);
+  if (!segment || !nextSegment) return 'straight';
+
+  const currentDir = normalize({
+    x: segment.end.x - segment.start.x,
+    y: segment.end.y - segment.start.y,
+  });
+  const nextDir = normalize({
+    x: nextSegment.end.x - nextSegment.start.x,
+    y: nextSegment.end.y - nextSegment.start.y,
+  });
+  const cross = currentDir.x * nextDir.y - currentDir.y * nextDir.x;
+  const dotValue = dot(currentDir, nextDir);
+
+  if (Math.abs(cross) < 0.25 && dotValue > 0.3) {
+    return 'straight';
+  }
+
+  return cross > 0 ? 'right' : 'left';
+}
+
+function getTurnLanePreference(turnIntent, lanes) {
+  const laneCount = Math.max(1, lanes || 1);
+  if (laneCount <= 1) return 0;
+  if (turnIntent === 'left') return 0;
+  if (turnIntent === 'right') return laneCount - 1;
+  return null;
+}
+
+function getPathDirection(fromId, toId) {
+  const from = getIntersectionById(fromId);
+  const to = getIntersectionById(toId);
+  if (!from || !to) return null;
+  return normalize({
+    x: to.x - from.x,
+    y: to.y - from.y,
+  });
+}
+
+function isStraightPathTransition(prevNodeId, currentId, nextId) {
+  if (!prevNodeId || !currentId || !nextId) return true;
+  const incoming = getPathDirection(prevNodeId, currentId);
+  const outgoing = getPathDirection(currentId, nextId);
+  if (!incoming || !outgoing) return true;
+  const cross = incoming.x * outgoing.y - incoming.y * outgoing.x;
+  const dotValue = dot(incoming, outgoing);
+  return Math.abs(cross) < 0.25 && dotValue > 0.3;
+}
+
+function getPathHeadingPenalty(currentId, nextId, endId) {
+  const travel = getPathDirection(currentId, nextId);
+  const towardEnd = getPathDirection(currentId, endId);
+  if (!travel || !towardEnd) return 0;
+  return 1 - clamp(dot(travel, towardEnd), -1, 1);
+}
+
+function createVehicleLaneDiscipline() {
+  return {
+    style: 'normal',
+    driftOffsetPx: 0,
+  };
+}
+
+function getVehicleLaneDrift(vehicle) {
+  return 0;
+}
+
+function getVehicleTurnLanePreference(vehicle, routeSegmentIndex, lanes) {
+  return getTurnLanePreference(getVehicleTurnIntentForRouteIndex(vehicle, routeSegmentIndex), lanes);
+}
+
+function getLaneShiftLimitForSegment(vehicle, routeSegmentIndex, lanes, fallback = null) {
+  const turnLane = getVehicleTurnLanePreference(vehicle, routeSegmentIndex, lanes);
+  if (turnLane == null) return fallback;
+  return Math.max(1, lanes - 1);
+}
+
+function getIntersectionLaneShiftLimit(vehicle, routeSegmentIndex, lanes) {
+  const laneCount = Math.max(1, lanes || 1);
+  if (laneCount <= 1) return 0;
+  const straightFallback = Math.min(MAX_STRAIGHT_LANE_CHANGE_PER_INTERSECTION, laneCount - 1);
+  return (
+    getLaneShiftLimitForSegment(vehicle, routeSegmentIndex, laneCount, straightFallback) ??
+    straightFallback
+  );
+}
+
+function getLanePreferenceScore(laneIndex, lanes, preferredLaneIndex, routeLaneIndex, vehicle) {
+  let score = 0;
+  if (preferredLaneIndex != null) {
+    score -= Math.abs(laneIndex - preferredLaneIndex) * 10;
+  }
+  if (routeLaneIndex != null) {
+    score -= Math.abs(laneIndex - routeLaneIndex) * 30;
+    if (laneIndex === routeLaneIndex) {
+      score += 24;
+    }
+  }
+  const looseDriver = vehicle?.laneStyle === 'loose';
+  if (looseDriver && routeLaneIndex != null && Math.abs(laneIndex - routeLaneIndex) === 1) {
+    score += 3;
+  }
+  return score;
+}
+
+function getVehicleBrakeLightState(vehicle) {
+  return Boolean(vehicle?.brakeLightOn);
+}
+
+function normalizeSignalMode(mode, fallback = 'adaptive') {
+  const value = String(mode || '');
+  return SIGNAL_MODE_VALUES.includes(value) ? value : fallback;
+}
+
+function normalizeRoadLanes(value, fallback = state.defaultRoadLanes ?? 2) {
+  return clamp(Number(value) || fallback || 2, 1, 8);
+}
+
+function normalizeScenarioPreset(value) {
+  return [
+    'sample-grid',
+    'grid3x3',
+    'grid4x4',
+    'linear',
+    'cross',
+    'star',
+    'diamond',
+    'bottleneck',
+    'ring',
+  ].includes(String(value || ''))
+    ? String(value)
+    : 'sample-grid';
+}
+
+function getScenarioPresetSelection() {
+  return normalizeScenarioPreset(state.currentScenarioId || 'sample-grid');
+}
+
+function updateScenarioPresetControl() {
+  if (!ui.scenarioPreset) return;
+  ui.scenarioPreset.value = getScenarioPresetSelection();
+}
+
+function getScenarioLaneSelection() {
+  if (state.roads.length === 0) {
+    return String(normalizeRoadLanes(state.defaultRoadLanes, 2));
+  }
+  const first = String(normalizeRoadLanes(state.roads[0]?.lanes, state.defaultRoadLanes));
+  for (let i = 1; i < state.roads.length; i += 1) {
+    if (String(normalizeRoadLanes(state.roads[i]?.lanes, state.defaultRoadLanes)) !== first) {
+      return 'mixed';
+    }
+  }
+  return first;
+}
+
+function updateScenarioLaneControl() {
+  if (!ui.scenarioLanes) return;
+  ui.scenarioLanes.value = getScenarioLaneSelection();
+}
+
+function loadScenarioPreset(preset) {
+  const nextPreset = normalizeScenarioPreset(preset);
+  if (nextPreset === 'sample-grid') {
+    clearMap();
+    buildSampleGrid();
+    return;
+  }
+  buildScenario(nextPreset);
+}
+
+function setIntersectionSignalMode(node, nextMode) {
+  if (!node?.signal) return;
+
+  node.signal.mode = normalizeSignalMode(nextMode, 'none');
+  ensureSignalWaitAges(node.signal);
+  ensureSignalCycleState(node.signal);
+  node.signal.elapsed = 0;
+  node.signal.color = 'green';
+  node.signal.pendingPhase = null;
+
+  if (node.signal.mode === 'none') {
+    for (const approach of APPROACH_ORDER) {
+      node.signal.waitAges[approach] = 0;
+    }
+    return;
+  }
+
+  const available = getIntersectionApproaches(node.id);
+  if (available.length > 0 && !available.includes(node.signal.phase)) {
+    node.signal.phase = available[0];
+  }
+}
+
+function getGlobalSignalModeSelection() {
+  if (state.intersections.length === 0) return 'adaptive';
+  const firstMode = normalizeSignalMode(state.intersections[0]?.signal?.mode, 'adaptive');
+  for (let i = 1; i < state.intersections.length; i += 1) {
+    const mode = normalizeSignalMode(state.intersections[i]?.signal?.mode, 'adaptive');
+    if (mode !== firstMode) return 'mixed';
+  }
+  return firstMode;
+}
+
+function updateGlobalSignalModeControl() {
+  if (!ui.globalSignalMode) return;
+  ui.globalSignalMode.value = getGlobalSignalModeSelection();
+}
+
+function resetView() {
+  state.view.x = 0;
+  state.view.y = 0;
+  state.view.zoom = 1;
+}
+
+function screenToWorld(x, y) {
+  return {
+    x: (x - state.view.x) / state.view.zoom,
+    y: (y - state.view.y) / state.view.zoom,
+  };
+}
+
 function distance(a, b) {
   return Math.hypot(b.x - a.x, b.y - a.y);
 }
@@ -112,8 +532,69 @@ function normalize(vec) {
   return { x: vec.x / len, y: vec.y / len };
 }
 
+function dot(a, b) {
+  return a.x * b.x + a.y * b.y;
+}
+
 function lerp(a, b, t) {
   return a + (b - a) * t;
+}
+
+function cubicBezierPoint(p0, p1, p2, p3, t) {
+  const inv = 1 - t;
+  const inv2 = inv * inv;
+  const t2 = t * t;
+  return {
+    x: p0.x * inv2 * inv + 3 * p1.x * inv2 * t + 3 * p2.x * inv * t2 + p3.x * t2 * t,
+    y: p0.y * inv2 * inv + 3 * p1.y * inv2 * t + 3 * p2.y * inv * t2 + p3.y * t2 * t,
+  };
+}
+
+function cubicBezierTangent(p0, p1, p2, p3, t) {
+  const inv = 1 - t;
+  const a = 3 * inv * inv;
+  const b = 6 * inv * t;
+  const c = 3 * t * t;
+  return {
+    x: a * (p1.x - p0.x) + b * (p2.x - p1.x) + c * (p3.x - p2.x),
+    y: a * (p1.y - p0.y) + b * (p2.y - p1.y) + c * (p3.y - p2.y),
+  };
+}
+
+function applyIntersectionHoldSpeed(vehicle, dt) {
+  if (!vehicle) return;
+  const target = INTERSECTION_HOLD_SPEED;
+  if (vehicle.speed <= target) return;
+  const decelStep = DECELERATION * Math.max(dt, FIXED_DT);
+  vehicle.speed = Math.max(target, vehicle.speed - decelStep);
+}
+
+function getVehicleStopDistance(vehicle, segment = null) {
+  return Math.max(
+    STOP_BUFFER,
+    getIntersectionControlRadius(segment) + getVehicleLength(vehicle) * 0.5 + 4
+  );
+}
+
+function getVehicleReserveDistance(vehicle, segment = null) {
+  return Math.max(INTERSECTION_RESERVE_DISTANCE, getVehicleStopDistance(vehicle, segment) + 4);
+}
+
+function getVehicleCommitDistance(vehicle, segment = null) {
+  return Math.max(
+    STOP_BUFFER - 4,
+    getIntersectionControlRadius(segment) + getVehicleLength(vehicle) * 0.5
+  );
+}
+
+function getStopLineProgress(segment, vehicle = null) {
+  if (!segment) return PRE_INTERSECTION_PROGRESS;
+  return clamp(1 - getVehicleStopDistance(vehicle, segment) / Math.max(1, segment.length), 0, 0.985);
+}
+
+function getCommitProgress(segment, vehicle = null) {
+  if (!segment) return PRE_INTERSECTION_PROGRESS;
+  return clamp(1 - getVehicleCommitDistance(vehicle, segment) / Math.max(1, segment.length), 0, 0.99);
 }
 
 function idNumber(id) {
@@ -147,6 +628,11 @@ function getRoadDrawWidth(lanes) {
   return ROAD_WIDTH + (n - 1) * ROAD_LANE_SPACING;
 }
 
+function getIntersectionControlRadius(segment = null) {
+  const lanes = segment?.road?.lanes ?? 1;
+  return Math.max(INTERSECTION_RADIUS, getRoadDrawWidth(lanes) * 0.5);
+}
+
 function makeEmptyQueue() {
   return { N: 0, E: 0, S: 0, W: 0 };
 }
@@ -163,6 +649,16 @@ function ensureSignalWaitAges(signal) {
   for (const approach of APPROACH_ORDER) {
     const value = Number(signal.waitAges[approach]);
     signal.waitAges[approach] = Number.isFinite(value) ? Math.max(0, value) : 0;
+  }
+}
+
+function ensureSignalCycleState(signal) {
+  if (!signal) return;
+  if (signal.color !== 'green' && signal.color !== 'yellow' && signal.color !== 'red') {
+    signal.color = 'green';
+  }
+  if (typeof signal.pendingPhase !== 'string') {
+    signal.pendingPhase = null;
   }
 }
 
@@ -241,6 +737,8 @@ function makeIntersection(x, y) {
     signal: {
       phase: 'N',
       elapsed: 0,
+      color: 'green',
+      pendingPhase: null,
       mode: 'adaptive',
       fixedGreen: 8,
       minGreen: 3,
@@ -256,11 +754,13 @@ function makeRoad(from, to) {
     from,
     to,
     speedLimit: 52,
-    lanes: 2, // 1–8 = lanes per direction (2 = 4 lanes total, default)
+    lanes: normalizeRoadLanes(state.defaultRoadLanes, 2), // 1–8 = lanes per direction
   };
 }
 
-function makeVehicle(route) {
+function makeVehicle(route, profile = null) {
+  const variant = resolveVehicleProfile(profile);
+  const laneDiscipline = createVehicleLaneDiscipline();
   return {
     id: `V${state.nextVehicleId++}`,
     route,
@@ -268,7 +768,21 @@ function makeVehicle(route) {
     progress: 0,
     speed: 0,
     laneIndex: 0,
-    color: palette[(state.nextVehicleId - 1) % palette.length],
+    type: variant.id,
+    label: variant.label,
+    length: variant.length,
+    width: variant.width,
+    safeGap: variant.safeGap,
+    speedFactor: variant.speedFactor,
+    accelerationFactor: variant.accelerationFactor,
+    brakingFactor: variant.brakingFactor,
+    color: variant.color,
+    laneStyle: laneDiscipline.style,
+    laneDriftOffsetPx: laneDiscipline.driftOffsetPx,
+    brakeLightOn: false,
+    intersectionCarrySpeed: 0,
+    intersectionCarryUntilProgress: 0,
+    plannedNextLaneIndex: null,
   };
 }
 
@@ -306,6 +820,7 @@ function clearVehicles() {
   state.vehicles = [];
   state.lastOverlapPairs = 0;
   state.collisionWarningTicks = 0;
+  state.overlapCheckCounter = 0;
 }
 
 function clearMap() {
@@ -323,14 +838,18 @@ function clearMap() {
   state.lastFlowMetrics = new Map();
   state.lastOverlapPairs = 0;
   state.collisionWarningTicks = 0;
+  state.overlapCheckCounter = 0;
   state.vehiclesCompleted = 0;
   state.phaseChangeCount = 0;
   state.currentScenarioId = null;
+  resetView();
+  updateScenarioPresetControl();
+  updateScenarioLaneControl();
   renderWeightTable();
   renderInspector();
 }
 
-function getPointerPosition(event) {
+function getCanvasPointerPosition(event) {
   const rect = canvas.getBoundingClientRect();
   const scaleX = canvas.width / rect.width;
   const scaleY = canvas.height / rect.height;
@@ -338,6 +857,61 @@ function getPointerPosition(event) {
     x: (event.clientX - rect.left) * scaleX,
     y: (event.clientY - rect.top) * scaleY,
   };
+}
+
+function getPointerPosition(event) {
+  const screen = getCanvasPointerPosition(event);
+  return screenToWorld(screen.x, screen.y);
+}
+
+function getVisibleWorldBounds() {
+  const topLeft = screenToWorld(0, 0);
+  const bottomRight = screenToWorld(canvas.width, canvas.height);
+  return {
+    minX: Math.min(topLeft.x, bottomRight.x),
+    maxX: Math.max(topLeft.x, bottomRight.x),
+    minY: Math.min(topLeft.y, bottomRight.y),
+    maxY: Math.max(topLeft.y, bottomRight.y),
+  };
+}
+
+function getMapBounds() {
+  if (state.intersections.length === 0) {
+    return null;
+  }
+
+  const xs = state.intersections.map((node) => node.x);
+  const ys = state.intersections.map((node) => node.y);
+  return {
+    minX: Math.min(...xs),
+    maxX: Math.max(...xs),
+    minY: Math.min(...ys),
+    maxY: Math.max(...ys),
+  };
+}
+
+function focusViewOnMap(padding = 110) {
+  const bounds = getMapBounds();
+  if (!bounds) {
+    resetView();
+    return;
+  }
+
+  const contentWidth = Math.max(140, bounds.maxX - bounds.minX + INTERSECTION_RADIUS * 4);
+  const contentHeight = Math.max(140, bounds.maxY - bounds.minY + INTERSECTION_RADIUS * 4);
+  const availableWidth = Math.max(220, canvas.width - padding * 2);
+  const availableHeight = Math.max(220, canvas.height - padding * 2);
+  const nextZoom = clamp(
+    Math.min(1.25, availableWidth / contentWidth, availableHeight / contentHeight),
+    MIN_VIEW_ZOOM,
+    MAX_VIEW_ZOOM
+  );
+  const centerX = (bounds.minX + bounds.maxX) * 0.5;
+  const centerY = (bounds.minY + bounds.maxY) * 0.5;
+
+  state.view.zoom = nextZoom;
+  state.view.x = canvas.width * 0.5 - centerX * nextZoom;
+  state.view.y = canvas.height * 0.52 - centerY * nextZoom;
 }
 
 function findIntersectionAt(x, y) {
@@ -452,6 +1026,19 @@ function redistributeVehiclesOnRoad(road) {
   }
 }
 
+function setAllRoadLanes(lanes) {
+  const nextLanes = normalizeRoadLanes(lanes, 2);
+  state.defaultRoadLanes = nextLanes;
+  for (const road of state.roads) {
+    const oldLanes = road.lanes ?? nextLanes;
+    road.lanes = nextLanes;
+    if (nextLanes > 1 && nextLanes !== oldLanes) {
+      redistributeVehiclesOnRoad(road);
+    }
+  }
+  updateScenarioLaneControl();
+}
+
 function setMode(mode) {
   state.mode = mode;
   if (mode !== 'connect-roads') {
@@ -517,6 +1104,9 @@ function renderWeightTable() {
 
 function renderInspector() {
   if (!ui.inspector) return;
+  updateGlobalSignalModeControl();
+  updateScenarioPresetControl();
+  updateScenarioLaneControl();
   if (!state.selectedType || !state.selectedId) {
     ui.inspector.innerHTML = 'Select an intersection or road.';
     return;
@@ -648,6 +1238,7 @@ function togglePhase(intersection, nextPhase = null, queue = null) {
   const available = getIntersectionApproaches(intersection.id);
   if (available.length === 0) return;
   ensureSignalWaitAges(intersection.signal);
+  ensureSignalCycleState(intersection.signal);
 
   let resolved = resolveApproach(intersection, nextPhase, queue);
   if (!resolved) {
@@ -659,18 +1250,36 @@ function togglePhase(intersection, nextPhase = null, queue = null) {
     }
   }
 
-  const previousPhase = intersection.signal.phase;
-  intersection.signal.phase = resolved;
-  intersection.signal.elapsed = 0;
-  intersection.signal.waitAges[resolved] = 0;
-  if (resolved !== previousPhase) {
-    state.phaseChangeCount += 1;
+  if (!resolved) return;
+
+  if (intersection.signal.color === 'yellow') {
+    intersection.signal.pendingPhase = resolved;
+    return;
   }
+
+  if (resolved === intersection.signal.phase) {
+    return;
+  }
+
+  intersection.signal.pendingPhase = resolved;
+  intersection.signal.color = 'yellow';
+  intersection.signal.elapsed = 0;
 }
 
 function handleCanvasPointerDown(event) {
+  const screen = getCanvasPointerPosition(event);
   const pointer = getPointerPosition(event);
   const hitIntersection = findIntersectionAt(pointer.x, pointer.y);
+  const hitRoad = hitIntersection ? null : findRoadAt(pointer.x, pointer.y);
+  const isPanButton = event.button === 1 || event.button === 2;
+
+  if (isPanButton || (state.mode === 'select' && event.button === 0 && !hitIntersection && !hitRoad)) {
+    state.dragPointerMode = 'pan';
+    state.dragPanLastScreen = screen;
+    state.dragPanMoved = false;
+    state.dragPanAllowsDeselect = !isPanButton && state.mode === 'select';
+    return;
+  }
 
   if (state.mode === 'add-intersection') {
     if (hitIntersection) {
@@ -709,35 +1318,68 @@ function handleCanvasPointerDown(event) {
 
   if (state.mode === 'select') {
     if (hitIntersection) {
+      state.dragPointerMode = 'intersection';
       state.dragIntersectionId = hitIntersection.id;
       selectObject('intersection', hitIntersection.id);
       return;
     }
 
-    const hitRoad = findRoadAt(pointer.x, pointer.y);
     if (hitRoad) {
       selectObject('road', hitRoad.id);
       return;
     }
-
-    state.selectedType = null;
-    state.selectedId = null;
-    renderInspector();
   }
 }
 
 function handleCanvasPointerMove(event) {
-  if (!state.dragIntersectionId) return;
+  if (state.dragPointerMode === 'pan' && state.dragPanLastScreen) {
+    const screen = getCanvasPointerPosition(event);
+    const dx = screen.x - state.dragPanLastScreen.x;
+    const dy = screen.y - state.dragPanLastScreen.y;
+    if (Math.abs(dx) > 0.01 || Math.abs(dy) > 0.01) {
+      state.dragPanMoved = true;
+    }
+    state.view.x += dx;
+    state.view.y += dy;
+    state.dragPanLastScreen = screen;
+    return;
+  }
+
+  if (state.dragPointerMode !== 'intersection' || !state.dragIntersectionId) return;
   const pointer = getPointerPosition(event);
   const node = getIntersectionById(state.dragIntersectionId);
   if (!node) return;
 
-  node.x = clamp(pointer.x, 24, canvas.width - 24);
-  node.y = clamp(pointer.y, 24, canvas.height - 24);
+  node.x = pointer.x;
+  node.y = pointer.y;
 }
 
 function handleCanvasPointerUp() {
+  if (state.dragPointerMode === 'pan' && !state.dragPanMoved && state.dragPanAllowsDeselect) {
+    state.selectedType = null;
+    state.selectedId = null;
+    renderInspector();
+  }
+  state.dragPointerMode = null;
   state.dragIntersectionId = null;
+  state.dragPanLastScreen = null;
+  state.dragPanMoved = false;
+  state.dragPanAllowsDeselect = false;
+}
+
+function handleCanvasWheel(event) {
+  event.preventDefault();
+  const screen = getCanvasPointerPosition(event);
+  const worldBefore = screenToWorld(screen.x, screen.y);
+  const zoomFactor = Math.exp(-event.deltaY * ZOOM_SENSITIVITY);
+  const nextZoom = clamp(state.view.zoom * zoomFactor, MIN_VIEW_ZOOM, MAX_VIEW_ZOOM);
+  if (Math.abs(nextZoom - state.view.zoom) < 0.0001) {
+    return;
+  }
+
+  state.view.zoom = nextZoom;
+  state.view.x = screen.x - worldBefore.x * nextZoom;
+  state.view.y = screen.y - worldBefore.y * nextZoom;
 }
 
 function buildNeighborGraph() {
@@ -774,26 +1416,50 @@ function shortestPath(startId, endId, previousNodeId = null) {
   // by an already-traversed edge (boundary spawn entry).
   const stateKey = (node, prev) => `${node}:${prev ?? ''}`;
   const dist = new Map();
+  const turns = new Map();
+  const headingPenalty = new Map();
   const prev = new Map(); // prev[stateKey] = { nodeId, prevNodeId }
   const unvisited = new Set();
   const startState = stateKey(startId, previousNodeId);
   dist.set(startState, 0);
+  turns.set(startState, 0);
+  headingPenalty.set(startState, 0);
   prev.set(startState, null);
   unvisited.add(startState);
 
+  function getCostTuple(key) {
+    return {
+      distance: dist.get(key) ?? Number.POSITIVE_INFINITY,
+      turns: turns.get(key) ?? Number.POSITIVE_INFINITY,
+      heading: headingPenalty.get(key) ?? Number.POSITIVE_INFINITY,
+    };
+  }
+
+  function isBetterCost(nextCost, existingCost) {
+    if (nextCost.distance < existingCost.distance - 1e-6) return true;
+    if (nextCost.distance > existingCost.distance + 1e-6) return false;
+    if (nextCost.turns < existingCost.turns) return true;
+    if (nextCost.turns > existingCost.turns) return false;
+    return nextCost.heading < existingCost.heading - 1e-6;
+  }
+
   while (unvisited.size > 0) {
     let bestState = null;
-    let best = Number.POSITIVE_INFINITY;
+    let bestCost = {
+      distance: Number.POSITIVE_INFINITY,
+      turns: Number.POSITIVE_INFINITY,
+      heading: Number.POSITIVE_INFINITY,
+    };
 
     for (const key of unvisited) {
-      const value = dist.get(key) ?? Number.POSITIVE_INFINITY;
-      if (value < best) {
-        best = value;
+      const value = getCostTuple(key);
+      if (isBetterCost(value, bestCost)) {
+        bestCost = value;
         bestState = key;
       }
     }
 
-    if (!bestState || best === Number.POSITIVE_INFINITY) {
+    if (!bestState || bestCost.distance === Number.POSITIVE_INFINITY) {
       break;
     }
 
@@ -816,9 +1482,16 @@ function shortestPath(startId, endId, previousNodeId = null) {
     for (const neighbor of neighbors) {
       if (neighbor.id === prevNodeId) continue; // No U-turn: don't go back to previous node
       const nextState = stateKey(neighbor.id, currentId);
-      const alt = best + neighbor.cost;
-      if (alt < (dist.get(nextState) ?? Number.POSITIVE_INFINITY)) {
-        dist.set(nextState, alt);
+      const nextCost = {
+        distance: bestCost.distance + neighbor.cost,
+        turns: bestCost.turns + (isStraightPathTransition(prevNodeId, currentId, neighbor.id) ? 0 : 1),
+        heading:
+          bestCost.heading + getPathHeadingPenalty(currentId, neighbor.id, endId),
+      };
+      if (isBetterCost(nextCost, getCostTuple(nextState))) {
+        dist.set(nextState, nextCost.distance);
+        turns.set(nextState, nextCost.turns);
+        headingPenalty.set(nextState, nextCost.heading);
         prev.set(nextState, bestState);
         unvisited.add(nextState);
       }
@@ -939,23 +1612,63 @@ function findRoadBetween(a, b) {
   );
 }
 
-function isSpawnLaneBlocked(route) {
-  if (!Array.isArray(route) || route.length < 2) return true;
+function buildSpawnCandidateVehicle(route, vehicleProfile = null) {
+  const variant = resolveVehicleProfile(vehicleProfile);
+  return {
+    id: '__spawn__',
+    route,
+    segmentIndex: 0,
+    progress: 0,
+    speed: 0,
+    laneIndex: 0,
+    type: variant.id,
+    label: variant.label,
+    length: variant.length,
+    width: variant.width,
+    safeGap: variant.safeGap,
+    speedFactor: variant.speedFactor,
+    accelerationFactor: variant.accelerationFactor,
+    brakingFactor: variant.brakingFactor,
+    color: variant.color,
+    laneStyle: 'normal',
+    laneDriftOffsetPx: 0,
+    brakeLightOn: false,
+    intersectionCarrySpeed: 0,
+    intersectionCarryUntilProgress: 0,
+  };
+}
 
-  const start = route[0];
-  const next = route[1];
-  const startNode = getIntersectionById(start);
-  const nextNode = getIntersectionById(next);
-  const laneLength =
-    startNode && nextNode ? Math.max(1, distance(startNode, nextNode)) : 120;
-  const minSpawnProgress = (VEHICLE_LENGTH + SAFE_GAP) / laneLength;
+function planSpawnPlacement(route, vehicleProfile = null) {
+  if (!Array.isArray(route) || route.length < 2) return null;
 
-  return state.vehicles.some(
-    (vehicle) =>
-      vehicle.route[vehicle.segmentIndex] === start &&
-      vehicle.route[vehicle.segmentIndex + 1] === next &&
-      vehicle.progress <= minSpawnProgress
+  const candidate = buildSpawnCandidateVehicle(route, vehicleProfile);
+  const firstSegment = getSegmentFromIds(route[0], route[1]);
+  if (!firstSegment) return null;
+
+  const startProgress = clamp(
+    getVehicleReleaseDistance(candidate) / Math.max(1, firstSegment.length),
+    0,
+    0.8
   );
+  const laneIndex = pickLaneWithSpace(
+    firstSegment.startId,
+    firstSegment.endId,
+    candidate.id,
+    startProgress,
+    firstSegment.road,
+    null,
+    null,
+    candidate,
+    0
+  );
+  if (laneIndex < 0) {
+    return null;
+  }
+
+  return {
+    progress: startProgress,
+    laneIndex,
+  };
 }
 
 function spawnVehicle() {
@@ -1020,41 +1733,21 @@ function spawnVehicle() {
     route = shortestPath(origin.id, destination.id);
   }
 
-  if (!route || route.length < 2 || isSpawnLaneBlocked(route)) {
+  const vehicleProfile = pickVehicleProfile();
+  const spawnPlacement = planSpawnPlacement(route, vehicleProfile);
+  if (!route || route.length < 2 || !spawnPlacement) {
     return false;
   }
 
-  const vehicle = makeVehicle(route);
-  const firstSegment = getVehicleSegment(vehicle);
-  if (firstSegment) {
-    const startProgress = INTERSECTION_RELEASE_DISTANCE / firstSegment.length;
-    vehicle.progress = clamp(startProgress, 0, 0.8);
-    const road = firstSegment.road;
-    const lanes = road?.lanes ?? 1;
-    if (lanes > 1) {
-      const picked = pickLaneWithSpace(
-        firstSegment.startId,
-        firstSegment.endId,
-        vehicle.id,
-        startProgress + (VEHICLE_LENGTH + SAFE_GAP) / firstSegment.length,
-        road
-      );
-      vehicle.laneIndex = picked >= 0 ? picked : 0;
-    } else {
-      vehicle.laneIndex = 0;
-    }
-  }
+  const vehicle = makeVehicle(route, vehicleProfile);
+  vehicle.progress = spawnPlacement.progress;
+  vehicle.laneIndex = spawnPlacement.laneIndex;
   state.vehicles.push(vehicle);
   return true;
 }
 
-function getVehicleSegment(vehicle) {
-  const startId = vehicle.route[vehicle.segmentIndex];
-  const endId = vehicle.route[vehicle.segmentIndex + 1];
-  if (!startId || !endId) {
-    return null;
-  }
-
+function getSegmentFromIds(startId, endId) {
+  if (!startId || !endId) return null;
   const start = getIntersectionById(startId);
   const end = getIntersectionById(endId);
   const road = findRoadBetween(startId, endId);
@@ -1073,11 +1766,100 @@ function getVehicleSegment(vehicle) {
   };
 }
 
-function getVehicleWorldPose(vehicle) {
-  const segment = getVehicleSegment(vehicle);
-  if (!segment) return null;
+function getVehicleSegment(vehicle) {
+  const startId = vehicle.route[vehicle.segmentIndex];
+  const endId = vehicle.route[vehicle.segmentIndex + 1];
+  return getSegmentFromIds(startId, endId);
+}
 
-  const t = clamp(vehicle.progress, 0, 1);
+function getVehicleNextLanePlanContext(vehicle, segment = getVehicleSegment(vehicle)) {
+  if (!vehicle || !segment) return null;
+  const nextStartId = segment.endId;
+  const nextEndId = vehicle.route[vehicle.segmentIndex + 2];
+  if (!nextEndId) {
+    return null;
+  }
+
+  const nextRoad = findRoadBetween(nextStartId, nextEndId);
+  const nextStart = getIntersectionById(nextStartId);
+  const nextEnd = getIntersectionById(nextEndId);
+  if (!nextRoad || !nextStart || !nextEnd) {
+    return null;
+  }
+
+  return {
+    nextStartId,
+    nextEndId,
+    nextRoad,
+    nextLength: Math.max(1, distance(nextStart, nextEnd)),
+  };
+}
+
+function canUseVehicleNextLane(vehicle, laneIndex, segment = getVehicleSegment(vehicle), entryProgress = null) {
+  const context = getVehicleNextLanePlanContext(vehicle, segment);
+  if (!context || laneIndex == null || laneIndex < 0) return false;
+  const minEntryProgress =
+    getIntersectionReleaseDistance({ length: context.nextLength, road: context.nextRoad }, vehicle) /
+    context.nextLength;
+  const resolvedEntryProgress = clamp(
+    Math.max(entryProgress ?? minEntryProgress, minEntryProgress),
+    0,
+    0.98
+  );
+  const checkLane = clamp(laneIndex, 0, Math.max(0, (context.nextRoad?.lanes ?? 1) - 1));
+  const entryMetrics = getLaneEntryMetrics(
+    context.nextStartId,
+    context.nextEndId,
+    vehicle.id,
+    resolvedEntryProgress,
+    checkLane,
+    context.nextRoad,
+    vehicle
+  );
+  return entryMetrics.clear && entryMetrics.frontGap >= entryMetrics.requiredFrontGap;
+}
+
+function pickVehicleNextLane(vehicle, segment = getVehicleSegment(vehicle), entryProgress = null) {
+  const context = getVehicleNextLanePlanContext(vehicle, segment);
+  if (!context) return -1;
+  const minEntryProgress =
+    getIntersectionReleaseDistance({ length: context.nextLength, road: context.nextRoad }, vehicle) /
+    context.nextLength;
+  const resolvedEntryProgress = clamp(
+    Math.max(entryProgress ?? minEntryProgress, minEntryProgress),
+    0,
+    0.98
+  );
+  return pickLaneWithSpace(
+    context.nextStartId,
+    context.nextEndId,
+    vehicle.id,
+    resolvedEntryProgress,
+    context.nextRoad,
+    vehicle.laneIndex ?? 0,
+    getIntersectionLaneShiftLimit(vehicle, vehicle.segmentIndex + 1, context.nextRoad?.lanes ?? 1),
+    vehicle,
+    vehicle.segmentIndex + 1
+  );
+}
+
+function resolveVehicleNextLane(vehicle, segment = getVehicleSegment(vehicle), entryProgress = null) {
+  if (canUseVehicleNextLane(vehicle, vehicle?.plannedNextLaneIndex, segment, entryProgress)) {
+    return vehicle.plannedNextLaneIndex;
+  }
+  return pickVehicleNextLane(vehicle, segment, entryProgress);
+}
+
+function refreshPlannedNextLanes(vehicles = state.vehicles) {
+  for (const vehicle of vehicles) {
+    const segment = getVehicleSegment(vehicle);
+    const plannedLane = pickVehicleNextLane(vehicle, segment);
+    vehicle.plannedNextLaneIndex = plannedLane >= 0 ? plannedLane : null;
+  }
+}
+
+function getLanePoseOnSegment(segment, laneIndex, progress, vehicle = null) {
+  const t = clamp(progress, 0, 1);
   const baseX = lerp(segment.start.x, segment.end.x, t);
   const baseY = lerp(segment.start.y, segment.end.y, t);
   const dir = normalize({
@@ -1086,18 +1868,159 @@ function getVehicleWorldPose(vehicle) {
   });
   const perp = { x: -dir.y, y: dir.x };
   const lanes = segment.road?.lanes ?? 1;
-  const laneIndex = Math.min(vehicle.laneIndex ?? 0, Math.max(0, lanes - 1));
-  const laneOffset = laneOffsetForDirection(segment.startId, segment.endId, laneIndex, lanes);
-
+  const lane = Math.min(Math.max(0, laneIndex || 0), Math.max(0, lanes - 1));
+  const laneOffset =
+    laneOffsetForDirection(segment.startId, segment.endId, lane, lanes) + getVehicleLaneDrift(vehicle);
   return {
     x: baseX + perp.x * laneOffset,
     y: baseY + perp.y * laneOffset,
     heading: Math.atan2(dir.y, dir.x),
+    dir,
+  };
+}
+
+function getVehicleWorldPose(vehicle) {
+  const segment = getVehicleSegment(vehicle);
+  if (!segment) return null;
+  const currentLaneIndex = vehicle.laneIndex ?? 0;
+  const linearPose = getLanePoseOnSegment(segment, currentLaneIndex, vehicle.progress, vehicle);
+
+  const nextStartId = vehicle.route[vehicle.segmentIndex + 1];
+  const nextEndId = vehicle.route[vehicle.segmentIndex + 2];
+  if (!nextStartId || !nextEndId) {
+    return { ...linearPose, segment };
+  }
+
+  const nextSegment = getSegmentFromIds(nextStartId, nextEndId);
+  if (!nextSegment) {
+    return { ...linearPose, segment };
+  }
+
+  const stopLineProgress = getStopLineProgress(segment, vehicle);
+  const turnStartProgress = clamp(
+    Math.max(
+      1 - getIntersectionReleaseDistance(segment, vehicle) / Math.max(1, segment.length),
+      stopLineProgress + 0.03
+    ),
+    TURN_BLEND_MIN_PROGRESS,
+    0.97
+  );
+  const remainingDistance = segment.length * (1 - clamp(vehicle.progress, 0, 1));
+  const closeToStopLine = vehicle.progress <= stopLineProgress + 0.008;
+  const canBlendThroughIntersection =
+    !closeToStopLine || canProceedThroughSignal(segment, remainingDistance, vehicle);
+  if (vehicle.progress < turnStartProgress) {
+    return { ...linearPose, segment };
+  }
+  if (!canBlendThroughIntersection) {
+    return { ...linearPose, segment };
+  }
+
+  const blend = clamp((vehicle.progress - turnStartProgress) / (1 - turnStartProgress), 0, 1);
+  const nextLaneIndex = vehicle.plannedNextLaneIndex ?? currentLaneIndex;
+  const straightThrough =
+    isStraightPathTransition(segment.startId, segment.endId, nextSegment.endId) &&
+    currentLaneIndex === nextLaneIndex;
+  const turnExitProgress = getIntersectionExitProgress(nextSegment, vehicle);
+  const p0Pose = getLanePoseOnSegment(segment, currentLaneIndex, turnStartProgress, vehicle);
+  const p3Pose = getLanePoseOnSegment(nextSegment, nextLaneIndex, turnExitProgress, vehicle);
+  if (straightThrough) {
+    return {
+      x: lerp(p0Pose.x, p3Pose.x, blend),
+      y: lerp(p0Pose.y, p3Pose.y, blend),
+      heading: linearPose.heading,
+      dir: linearPose.dir,
+      segment,
+    };
+  }
+  const chord = Math.hypot(p3Pose.x - p0Pose.x, p3Pose.y - p0Pose.y);
+  const controlCap = Math.max(8, Math.min(TURN_CONTROL_MAX_DISTANCE, chord * 0.48));
+
+  const inControlDist = clamp(
+    segment.length * 0.18,
+    TURN_CONTROL_MIN_DISTANCE,
+    TURN_CONTROL_MAX_DISTANCE
+  );
+  const outControlDist = clamp(
+    nextSegment.length * 0.18,
+    TURN_CONTROL_MIN_DISTANCE,
+    TURN_CONTROL_MAX_DISTANCE
+  );
+  const inControl = Math.min(inControlDist, controlCap);
+  const outControl = Math.min(outControlDist, controlCap);
+  const p1 = {
+    x: p0Pose.x + p0Pose.dir.x * inControl,
+    y: p0Pose.y + p0Pose.dir.y * inControl,
+  };
+  const p2 = {
+    x: p3Pose.x - p3Pose.dir.x * outControl,
+    y: p3Pose.y - p3Pose.dir.y * outControl,
+  };
+
+  const curvedPoint = cubicBezierPoint(p0Pose, p1, p2, p3Pose, blend);
+  const tangent = cubicBezierTangent(p0Pose, p1, p2, p3Pose, blend);
+  const tangentLen = Math.hypot(tangent.x, tangent.y);
+  const heading =
+    tangentLen > 0.001 ? Math.atan2(tangent.y, tangent.x) : p3Pose.heading;
+
+  return {
+    x: curvedPoint.x,
+    y: curvedPoint.y,
+    heading,
     segment,
   };
 }
 
-function buildIntersectionReservations() {
+function rerouteVehicleFromNode(vehicle, currentNodeId, previousNodeId = null) {
+  if (!vehicle || !currentNodeId) return false;
+  const destinationId = vehicle.route[vehicle.route.length - 1];
+  if (!destinationId) return false;
+  if (currentNodeId === destinationId) {
+    vehicle.route = [currentNodeId];
+    vehicle.segmentIndex = 0;
+    vehicle.progress = 0;
+    vehicle.speed = 0;
+    return true;
+  }
+
+  const newRoute = shortestPath(currentNodeId, destinationId, previousNodeId);
+  if (!newRoute || newRoute.length < 2) {
+    return false;
+  }
+
+  vehicle.route = newRoute;
+  vehicle.segmentIndex = 0;
+  vehicle.progress = 0;
+  return true;
+}
+
+function canVehicleClearIntersection(vehicle, segment = getVehicleSegment(vehicle)) {
+  if (!vehicle || !segment) return false;
+  const context = getVehicleNextLanePlanContext(vehicle, segment);
+  if (!context) {
+    return true;
+  }
+
+  const minEntryProgress =
+    getIntersectionReleaseDistance({ length: context.nextLength, road: context.nextRoad }, vehicle) /
+    context.nextLength;
+  const pickedLane = resolveVehicleNextLane(vehicle, segment, minEntryProgress);
+  if (pickedLane < 0) {
+    return false;
+  }
+  const entryMetrics = getLaneEntryMetrics(
+    context.nextStartId,
+    context.nextEndId,
+    vehicle.id,
+    minEntryProgress,
+    pickedLane,
+    context.nextRoad,
+    vehicle
+  );
+  return entryMetrics.frontGap >= getIntersectionReleaseDistance({ length: context.nextLength }, vehicle);
+}
+
+function buildIntersectionReservations(dt = FIXED_DT) {
   const reservations = new Map();
 
   function reserveClosest(intersectionId, vehicleId, distanceFromCenter) {
@@ -1115,14 +2038,23 @@ function buildIntersectionReservations() {
     if (!segment) continue;
 
     const remainingDistance = segment.length * (1 - vehicle.progress);
+    const reserveLookahead =
+      Math.max(vehicle.speed, getVehicleTargetRoadSpeed(vehicle, segment.road)) * Math.max(dt, FIXED_DT) + 1;
+    const committedToIntersection =
+      remainingDistance <= getVehicleCommitDistance(vehicle, segment) + reserveLookahead;
     // Only vehicles with green can reserve the intersection they're approaching.
     // Otherwise a stopped vehicle at red blocks vehicles with green from entering.
-    if (remainingDistance <= INTERSECTION_RESERVE_DISTANCE && isLaneGreen(segment)) {
+    if (
+      remainingDistance <= getVehicleReserveDistance(vehicle, segment) + reserveLookahead &&
+      isLaneGreen(segment, remainingDistance, vehicle) &&
+      (committedToIntersection || canVehicleClearIntersection(vehicle, segment))
+    ) {
       reserveClosest(segment.endId, vehicle.id, remainingDistance);
     }
 
     const distanceFromStart = segment.length * vehicle.progress;
-    if (distanceFromStart <= INTERSECTION_RELEASE_DISTANCE) {
+    const exitReserveDistance = getIntersectionReleaseDistance(segment, vehicle);
+    if (distanceFromStart <= exitReserveDistance) {
       reserveClosest(segment.startId, vehicle.id, distanceFromStart);
     }
   }
@@ -1134,10 +2066,68 @@ function buildIntersectionReservations() {
   return ownerMap;
 }
 
-function hasLaneEntrySpace(startId, endId, vehicleId, requiredFrontProgress, laneIndex = 0) {
-  const road = findRoadBetween(startId, endId);
-  const lanes = road?.lanes ?? 1;
+function isIntersectionClearForPhaseSwitch(intersectionId) {
+  for (const vehicle of state.vehicles) {
+    const segment = getVehicleSegment(vehicle);
+    if (!segment) continue;
+
+    if (segment.endId === intersectionId) {
+      const remainingDistance = segment.length * (1 - vehicle.progress);
+      if (remainingDistance <= getVehicleCommitDistance(vehicle, segment) + 1) {
+        return false;
+      }
+    }
+
+    if (segment.startId === intersectionId) {
+      const distanceFromStart = segment.length * vehicle.progress;
+      if (distanceFromStart <= getIntersectionReleaseDistance(segment, vehicle) + 1) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+function ignoresReservationForReverseLane(segment, reservationOwnerId) {
+  if (!segment || !reservationOwnerId) return false;
+  const owner = state.vehicles.find((vehicle) => vehicle.id === reservationOwnerId);
+  if (!owner) return false;
+  const ownerSegment = getVehicleSegment(owner);
+  if (!ownerSegment) return false;
+
+  const justExitedSameIntersection =
+    ownerSegment.startId === segment.endId &&
+    ownerSegment.endId === segment.startId &&
+    owner.progress * ownerSegment.length <= getVehicleReleaseDistance(owner);
+
+  return justExitedSameIntersection;
+}
+
+function getLaneEntryMetrics(
+  startId,
+  endId,
+  vehicleId,
+  entryProgress,
+  laneIndex = 0,
+  road = null,
+  candidateVehicle = null
+) {
+  const resolvedRoad = road || findRoadBetween(startId, endId);
+  const lanes = resolvedRoad?.lanes ?? 1;
   const checkLane = Math.min(laneIndex ?? 0, Math.max(0, lanes - 1));
+  const start = getIntersectionById(startId);
+  const end = getIntersectionById(endId);
+  const segmentLength = start && end ? Math.max(1, distance(start, end)) : 1;
+  const candidate = candidateVehicle || {
+    length: DEFAULT_VEHICLE_LENGTH,
+    width: DEFAULT_VEHICLE_WIDTH,
+    safeGap: DEFAULT_SAFE_GAP,
+  };
+  let clear = true;
+  let laneLoad = 0;
+  let vehiclesAhead = 0;
+  let frontGap = segmentLength * (1 - clamp(entryProgress, 0, 1));
+  const requiredFrontGap = getIntersectionReleaseDistance({ length: segmentLength }, candidate);
 
   for (const other of state.vehicles) {
     if (other.id === vehicleId) continue;
@@ -1148,24 +2138,136 @@ function hasLaneEntrySpace(startId, endId, vehicleId, requiredFrontProgress, lan
       const otherLane = Math.min(other.laneIndex ?? 0, Math.max(0, lanes - 1));
       if (otherLane !== checkLane) continue;
     }
-    if (other.progress < requiredFrontProgress) {
-      return false;
+    laneLoad += 1;
+    const centerDelta = (other.progress - entryProgress) * segmentLength;
+    const centerDistance = Math.abs(centerDelta);
+    if (centerDistance < getVehicleSpacingDistance(other, candidate)) {
+      clear = false;
+    }
+    if (centerDelta >= 0) {
+      vehiclesAhead += 1;
+      const bodyGap = Math.max(0, centerDelta - getVehicleBodyClearance(other, candidate));
+      frontGap = Math.min(frontGap, bodyGap);
     }
   }
-  return true;
+
+  return {
+    clear,
+    laneLoad,
+    vehiclesAhead,
+    frontGap,
+    requiredFrontGap,
+  };
 }
 
-function pickLaneWithSpace(startId, endId, vehicleId, requiredFrontProgress, road) {
+function hasLaneEntrySpace(
+  startId,
+  endId,
+  vehicleId,
+  entryProgress,
+  laneIndex = 0,
+  road = null,
+  candidateVehicle = null
+) {
+  const metrics = getLaneEntryMetrics(
+    startId,
+    endId,
+    vehicleId,
+    entryProgress,
+    laneIndex,
+    road,
+    candidateVehicle
+  );
+  return metrics.clear && metrics.frontGap >= metrics.requiredFrontGap;
+}
+
+function pickLaneWithSpace(
+  startId,
+  endId,
+  vehicleId,
+  entryProgress,
+  road,
+  preferredLaneIndex = null,
+  maxLaneShift = null,
+  candidateVehicle = null,
+  routeSegmentIndex = null
+) {
   const lanes = road?.lanes ?? 1;
+  if (lanes <= 1) {
+    return hasLaneEntrySpace(startId, endId, vehicleId, entryProgress, 0, road, candidateVehicle)
+      ? 0
+      : -1;
+  }
+
+  const preferred =
+    preferredLaneIndex == null
+      ? null
+      : clamp(preferredLaneIndex, 0, Math.max(0, lanes - 1));
+  const routeLaneIndex =
+    candidateVehicle == null ? null : getVehicleTurnLanePreference(candidateVehicle, routeSegmentIndex, lanes);
+  if (routeLaneIndex != null) {
+    if (preferred != null && maxLaneShift != null && Math.abs(routeLaneIndex - preferred) > maxLaneShift) {
+      return -1;
+    }
+    return hasLaneEntrySpace(
+      startId,
+      endId,
+      vehicleId,
+      entryProgress,
+      routeLaneIndex,
+      road,
+      candidateVehicle
+    )
+      ? routeLaneIndex
+      : -1;
+  }
+  let bestLane = -1;
+  let bestScore = Number.NEGATIVE_INFINITY;
+
   for (let i = 0; i < lanes; i += 1) {
-    if (hasLaneEntrySpace(startId, endId, vehicleId, requiredFrontProgress, i)) {
-      return i;
+    if (preferred != null && maxLaneShift != null && Math.abs(i - preferred) > maxLaneShift) {
+      continue;
+    }
+    const metrics = getLaneEntryMetrics(
+      startId,
+      endId,
+      vehicleId,
+      entryProgress,
+      i,
+      road,
+      candidateVehicle
+    );
+    if (!metrics.clear || metrics.frontGap < metrics.requiredFrontGap) {
+      continue;
+    }
+    const lanePreferenceScore = getLanePreferenceScore(
+      i,
+      lanes,
+      preferred,
+      routeLaneIndex,
+      candidateVehicle
+    );
+    const score = metrics.frontGap * 1.8 - metrics.vehiclesAhead * 22 - metrics.laneLoad * 10 + lanePreferenceScore;
+    if (
+      score > bestScore ||
+      (score === bestScore &&
+        routeLaneIndex != null &&
+        bestLane >= 0 &&
+        Math.abs(i - routeLaneIndex) < Math.abs(bestLane - routeLaneIndex)) ||
+      (score === bestScore &&
+        routeLaneIndex == null &&
+        preferred != null &&
+        bestLane >= 0 &&
+        Math.abs(i - preferred) < Math.abs(bestLane - preferred))
+    ) {
+      bestScore = score;
+      bestLane = i;
     }
   }
-  return -1;
+  return bestLane;
 }
 
-function enforceLaneSeparation(vehicles) {
+function enforceLaneSeparation(vehicles, dt = FIXED_DT) {
   const lanes = new Map();
 
   for (const vehicle of vehicles) {
@@ -1186,38 +2288,311 @@ function enforceLaneSeparation(vehicles) {
       const lead = laneEntries[i - 1];
       const follower = laneEntries[i];
       const minProgressGap =
-        (VEHICLE_LENGTH + SAFE_GAP) / Math.max(1, follower.segment.length);
+        getVehicleSpacingDistance(lead.vehicle, follower.vehicle) /
+        Math.max(1, follower.segment.length);
       const maxFollowerProgress = lead.vehicle.progress - minProgressGap;
 
       if (follower.vehicle.progress > maxFollowerProgress) {
         follower.vehicle.progress = Math.max(0, maxFollowerProgress);
-        follower.vehicle.speed = Math.min(follower.vehicle.speed, lead.vehicle.speed);
+        if (follower.vehicle.speed > lead.vehicle.speed) {
+          const decelStep = DECELERATION * Math.max(dt, FIXED_DT);
+          follower.vehicle.speed = Math.max(
+            lead.vehicle.speed,
+            follower.vehicle.speed - decelStep
+          );
+        }
       }
     }
   }
 }
 
-function countVehicleOverlaps() {
+function sharedIntersectionClearance(segmentA, progressA, vehicleA, segmentB, progressB, vehicleB) {
+  if (!segmentA || !segmentB) return false;
+
+  const sharedIds = [
+    segmentA.startId === segmentB.startId ? segmentA.startId : null,
+    segmentA.startId === segmentB.endId ? segmentA.startId : null,
+    segmentA.endId === segmentB.startId ? segmentA.endId : null,
+    segmentA.endId === segmentB.endId ? segmentA.endId : null,
+  ].filter(Boolean);
+  const uniqueSharedIds = [...new Set(sharedIds)];
+
+  if (uniqueSharedIds.length === 0) return false;
+  const protectedRadius =
+    INTERSECTION_RESERVE_DISTANCE + Math.max(getVehicleReleaseDistance(vehicleA), getVehicleReleaseDistance(vehicleB)) + 2;
+  const distanceFromShared = (segment, progress, sharedId) => {
+    if (segment.startId === sharedId) return segment.length * progress;
+    if (segment.endId === sharedId) return segment.length * (1 - progress);
+    return Number.POSITIVE_INFINITY;
+  };
+
+  return uniqueSharedIds.some((sharedId) => {
+    const aDistance = distanceFromShared(segmentA, progressA, sharedId);
+    const bDistance = distanceFromShared(segmentB, progressB, sharedId);
+    return aDistance <= protectedRadius && bDistance <= protectedRadius;
+  });
+}
+
+function rotateLocalPoint(point, pose) {
+  const cos = Math.cos(pose?.heading ?? 0);
+  const sin = Math.sin(pose?.heading ?? 0);
+  return {
+    x: pose.x + point.x * cos - point.y * sin,
+    y: pose.y + point.x * sin + point.y * cos,
+  };
+}
+
+function getVehicleCollisionPolygon(vehicle, pose) {
+  const length = getVehicleLength(vehicle);
+  const width = getVehicleWidth(vehicle);
+  const localPoints = [
+    { x: length * 0.5, y: 0 },
+    { x: -length * 0.45, y: width * 0.5 },
+    { x: -length * 0.45, y: -width * 0.5 },
+  ];
+  return localPoints.map((point) => rotateLocalPoint(point, pose));
+}
+
+function getPolygonAxes(points) {
+  const axes = [];
+  for (let i = 0; i < points.length; i += 1) {
+    const a = points[i];
+    const b = points[(i + 1) % points.length];
+    const edge = { x: b.x - a.x, y: b.y - a.y };
+    axes.push(normalize({ x: -edge.y, y: edge.x }));
+  }
+  return axes;
+}
+
+function getPolygonBounds(points) {
+  let minX = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY;
+  let minY = Number.POSITIVE_INFINITY;
+  let maxY = Number.NEGATIVE_INFINITY;
+  for (const point of points) {
+    minX = Math.min(minX, point.x);
+    maxX = Math.max(maxX, point.x);
+    minY = Math.min(minY, point.y);
+    maxY = Math.max(maxY, point.y);
+  }
+  return { minX, maxX, minY, maxY };
+}
+
+function doBoundsOverlap(boundsA, boundsB) {
+  return !(
+    boundsA.maxX < boundsB.minX ||
+    boundsB.maxX < boundsA.minX ||
+    boundsA.maxY < boundsB.minY ||
+    boundsB.maxY < boundsA.minY
+  );
+}
+
+function projectPolygon(points, axis) {
+  let min = Number.POSITIVE_INFINITY;
+  let max = Number.NEGATIVE_INFINITY;
+  for (const point of points) {
+    const value = dot(point, axis);
+    min = Math.min(min, value);
+    max = Math.max(max, value);
+  }
+  return { min, max };
+}
+
+function doVehicleBodiesOverlap(poseA, poseB) {
+  if (!poseA || !poseB) return false;
+  const polyA = getVehicleCollisionPolygon(poseA.vehicle, poseA);
+  const polyB = getVehicleCollisionPolygon(poseB.vehicle, poseB);
+  const axes = [...getPolygonAxes(polyA), ...getPolygonAxes(polyB)];
+  for (const axis of axes) {
+    const a = projectPolygon(polyA, axis);
+    const b = projectPolygon(polyB, axis);
+    if (a.max <= b.min || b.max <= a.min) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function isSerializedTurnHandoff(poseA, poseB) {
+  if (!poseA?.segment || !poseB?.segment) return false;
+
+  function matches(approachPose, exitPose) {
+    if (approachPose.segment.endId !== exitPose.segment.startId) {
+      return false;
+    }
+    const remainingToShared = approachPose.segment.length * (1 - approachPose.progress);
+    const exitDistance = exitPose.segment.length * exitPose.progress;
+    const releaseEnvelope = Math.max(
+      getVehicleReleaseDistance(exitPose.vehicle) + INTERSECTION_RADIUS,
+      exitPose.segment.length * 0.38
+    );
+    return (
+      remainingToShared <= getVehicleReleaseDistance(approachPose.vehicle) + 2 &&
+      exitDistance <= releaseEnvelope
+    );
+  }
+
+  return matches(poseA, poseB) || matches(poseB, poseA);
+}
+
+function isSeparatedIntersectionApproachExitPair(poseA, poseB) {
+  if (!poseA?.segment || !poseB?.segment) return false;
+
+  function matches(approachPose, exitPose) {
+    if (approachPose.segment.endId !== exitPose.segment.startId) {
+      return false;
+    }
+    const stopLineProgress = getStopLineProgress(approachPose.segment, approachPose.vehicle);
+    const exitClearProgress = clamp(
+      getIntersectionExitProgress(exitPose.segment, exitPose.vehicle) + 0.05,
+      0,
+      0.35
+    );
+    return approachPose.progress <= stopLineProgress + 0.03 && exitPose.progress <= exitClearProgress;
+  }
+
+  return matches(poseA, poseB) || matches(poseB, poseA);
+}
+
+function isSeparatedParallelLanePair(poseA, poseB) {
+  if (!poseA?.segment || !poseB?.segment) return false;
+  return (
+    poseA.segment.startId === poseB.segment.startId &&
+    poseA.segment.endId === poseB.segment.endId &&
+    (poseA.vehicle.laneIndex ?? 0) !== (poseB.vehicle.laneIndex ?? 0)
+  );
+}
+
+function isSeparatedOpposingApproachPair(poseA, poseB) {
+  if (!poseA?.segment || !poseB?.segment) return false;
+  if (poseA.segment.endId !== poseB.segment.endId) return false;
+  if (segmentOrientation(poseA.segment.start, poseA.segment.end) !== segmentOrientation(poseB.segment.start, poseB.segment.end)) {
+    return false;
+  }
+  const dirA = normalize({
+    x: poseA.segment.end.x - poseA.segment.start.x,
+    y: poseA.segment.end.y - poseA.segment.start.y,
+  });
+  const dirB = normalize({
+    x: poseB.segment.end.x - poseB.segment.start.x,
+    y: poseB.segment.end.y - poseB.segment.start.y,
+  });
+  if (dot(dirA, dirB) > -0.92) {
+    return false;
+  }
+  const remainingA = poseA.segment.length * (1 - poseA.progress);
+  const remainingB = poseB.segment.length * (1 - poseB.progress);
+  return (
+    remainingA <= getVehicleStopDistance(poseA.vehicle, poseA.segment) + 4 &&
+    remainingB <= getVehicleStopDistance(poseB.vehicle, poseB.segment) + 4
+  );
+}
+
+function isQueuedCrossApproachPair(poseA, poseB) {
+  if (!poseA?.segment || !poseB?.segment) return false;
+  if (poseA.segment.endId !== poseB.segment.endId) return false;
+  if (segmentOrientation(poseA.segment.start, poseA.segment.end) === segmentOrientation(poseB.segment.start, poseB.segment.end)) {
+    return false;
+  }
+  const nearStopA = poseA.progress <= getStopLineProgress(poseA.segment, poseA.vehicle) + 0.05;
+  const nearStopB = poseB.progress <= getStopLineProgress(poseB.segment, poseB.vehicle) + 0.05;
+  if (!nearStopA && !nearStopB) {
+    return false;
+  }
+  const committedA = poseA.progress >= getCommitProgress(poseA.segment, poseA.vehicle);
+  const committedB = poseB.progress >= getCommitProgress(poseB.segment, poseB.vehicle);
+  return !(committedA && committedB);
+}
+
+function isQueuedIntersectionTailPair(poseA, poseB) {
+  if (!poseA?.segment || !poseB?.segment) return false;
+
+  function matches(leadPose, tailPose) {
+    if (
+      leadPose.segment.startId !== tailPose.segment.startId ||
+      leadPose.segment.endId !== tailPose.segment.endId
+    ) {
+      return false;
+    }
+    if ((leadPose.vehicle.laneIndex ?? 0) !== (tailPose.vehicle.laneIndex ?? 0)) {
+      return false;
+    }
+    if (leadPose.progress <= tailPose.progress) {
+      return false;
+    }
+    const stopLineProgress = getStopLineProgress(tailPose.segment, tailPose.vehicle);
+    const centerGap = (leadPose.progress - tailPose.progress) * tailPose.segment.length;
+    return (
+      leadPose.progress >= PRE_INTERSECTION_PROGRESS - 0.01 &&
+      tailPose.progress >= stopLineProgress + 0.03 &&
+      centerGap >= getVehicleBodyClearance(leadPose.vehicle, tailPose.vehicle) + 4
+    );
+  }
+
+  return matches(poseA, poseB) || matches(poseB, poseA);
+}
+
+function collectVehicleOverlaps(limit = Number.POSITIVE_INFINITY) {
   const poses = [];
   for (const vehicle of state.vehicles) {
     const pose = getVehicleWorldPose(vehicle);
     if (pose) {
-      poses.push(pose);
+      poses.push({
+        ...pose,
+        progress: vehicle.progress,
+        vehicle,
+      });
     }
   }
 
-  let overlaps = 0;
+  const overlaps = [];
   for (let i = 0; i < poses.length; i += 1) {
     for (let j = i + 1; j < poses.length; j += 1) {
-      const dx = poses[i].x - poses[j].x;
-      const dy = poses[i].y - poses[j].y;
-      if (Math.hypot(dx, dy) < COLLISION_DISTANCE) {
-        overlaps += 1;
+      if (
+        doVehicleBodiesOverlap(poses[i], poses[j]) &&
+        !isSerializedTurnHandoff(poses[i], poses[j]) &&
+        !isSeparatedIntersectionApproachExitPair(poses[i], poses[j]) &&
+        !isSeparatedParallelLanePair(poses[i], poses[j]) &&
+        !isSeparatedOpposingApproachPair(poses[i], poses[j]) &&
+        !isQueuedCrossApproachPair(poses[i], poses[j]) &&
+        !isQueuedIntersectionTailPair(poses[i], poses[j])
+      ) {
+        overlaps.push({
+          a: {
+            id: poses[i].vehicle.id,
+            lane_from: poses[i].segment.startId,
+            lane_to: poses[i].segment.endId,
+            lane_index: poses[i].vehicle.laneIndex ?? 0,
+            progress: round(poses[i].progress, 3),
+          },
+          b: {
+            id: poses[j].vehicle.id,
+            lane_from: poses[j].segment.startId,
+            lane_to: poses[j].segment.endId,
+            lane_index: poses[j].vehicle.laneIndex ?? 0,
+            progress: round(poses[j].progress, 3),
+          },
+        });
+        if (overlaps.length >= limit) {
+          return overlaps;
+        }
       }
     }
   }
 
   return overlaps;
+}
+
+function countVehicleOverlaps() {
+  return collectVehicleOverlaps().length;
+}
+
+function getOverlapCheckInterval(vehicleCount) {
+  if (vehicleCount >= 160) return 12;
+  if (vehicleCount >= 120) return 8;
+  if (vehicleCount >= 80) return 6;
+  if (vehicleCount >= 40) return 3;
+  return 1;
 }
 
 function buildLaneGapMap() {
@@ -1246,7 +2621,9 @@ function buildLaneGapMap() {
     for (let i = 1; i < laneList.length; i += 1) {
       const front = laneList[i - 1];
       const follower = laneList[i];
-      const gap = (front.progress - follower.progress) * follower.length - VEHICLE_LENGTH;
+      const gap =
+        (front.progress - follower.progress) * follower.length -
+        getVehicleBodyClearance(front.vehicle, follower.vehicle);
       gapMap.set(follower.vehicle.id, Math.max(0, gap));
     }
   }
@@ -1254,12 +2631,32 @@ function buildLaneGapMap() {
   return gapMap;
 }
 
-function isLaneGreen(segment) {
+function getApproachSignalColor(intersection, approach) {
+  if (!intersection || !approach) return 'green';
+  if (intersection.signal.mode === 'none') return 'green';
+  ensureSignalCycleState(intersection.signal);
+  if (intersection.signal.color === 'red') return 'red';
+  if (intersection.signal.phase !== approach) return 'red';
+  return intersection.signal.color === 'yellow' ? 'yellow' : 'green';
+}
+
+function canProceedThroughSignal(segment, remainingDistance = Number.POSITIVE_INFINITY, vehicle = null) {
   const target = getIntersectionById(segment.endId);
   if (!target) return true;
   if (target.signal.mode === 'none') return true;
+  // Once the vehicle body has reached the intersection entry, it is committed to clear it.
+  if (remainingDistance <= getVehicleCommitDistance(vehicle, segment)) return true;
   const approach = getApproachKey(segment.start, segment.end);
-  return target.signal.phase === approach;
+  const color = getApproachSignalColor(target, approach);
+  if (color === 'green') return true;
+  if (color === 'yellow') {
+    return remainingDistance <= YELLOW_CLEARANCE_DISTANCE;
+  }
+  return false;
+}
+
+function isLaneGreen(segment, remainingDistance = Number.POSITIVE_INFINITY, vehicle = null) {
+  return canProceedThroughSignal(segment, remainingDistance, vehicle);
 }
 
 function computeQueueMetrics() {
@@ -1323,7 +2720,7 @@ function computeFlowMetrics(laneLoads) {
         const downstreamKey = laneKey(downStart.id, downEnd.id);
         const downstreamLoad = laneLoads.get(downstreamKey) || 0;
         const downstreamLength = Math.max(1, distance(downStart, downEnd));
-        const downstreamCapacity = Math.max(2, downstreamLength / (VEHICLE_LENGTH + SAFE_GAP));
+        const downstreamCapacity = Math.max(2, downstreamLength / AVERAGE_VEHICLE_SPACING);
         const occupancy = clamp(downstreamLoad / downstreamCapacity, 0, 2);
         const releaseFactor = clamp(1.2 - occupancy * 0.65, 0.45, 1.2);
         contribution *= releaseFactor;
@@ -1513,6 +2910,9 @@ function updateSignals(dt, queueMetrics) {
     if (availableApproaches.length === 0) {
       signal.elapsed = 0;
       ensureSignalWaitAges(signal);
+      ensureSignalCycleState(signal);
+      signal.color = 'green';
+      signal.pendingPhase = null;
       for (const approach of APPROACH_ORDER) {
         signal.waitAges[approach] = 0;
       }
@@ -1522,6 +2922,9 @@ function updateSignals(dt, queueMetrics) {
     if (signal.mode === 'none') {
       signal.elapsed = 0;
       ensureSignalWaitAges(signal);
+      ensureSignalCycleState(signal);
+      signal.color = 'green';
+      signal.pendingPhase = null;
       for (const approach of APPROACH_ORDER) {
         signal.waitAges[approach] = 0;
       }
@@ -1529,15 +2932,49 @@ function updateSignals(dt, queueMetrics) {
     }
 
     ensureSignalWaitAges(signal);
+    ensureSignalCycleState(signal);
     if (!availableApproaches.includes(signal.phase)) {
       signal.phase = availableApproaches[0];
       signal.elapsed = 0;
+      signal.color = 'green';
+      signal.pendingPhase = null;
+    }
+    if (signal.pendingPhase && !availableApproaches.includes(signal.pendingPhase)) {
+      signal.pendingPhase = null;
     }
 
     signal.elapsed += dt;
     const queue = queueMetrics.get(node.id) || makeEmptyQueue();
     const flow = flowMetrics.get(node.id) || makeEmptyQueue();
     updateWaitAges(signal, queue, flow, availableApproaches, dt);
+
+    if (signal.color === 'yellow') {
+      if (signal.elapsed >= SIGNAL_YELLOW_DURATION) {
+        signal.color = 'red';
+        signal.elapsed = 0;
+      }
+      continue;
+    }
+
+    if (signal.color === 'red') {
+      if (signal.elapsed >= SIGNAL_ALL_RED_DURATION) {
+        const nextPhase =
+          resolveApproach(node, signal.pendingPhase, queue) ||
+          signal.pendingPhase ||
+          signal.phase;
+        const previousPhase = signal.phase;
+        signal.phase = nextPhase;
+        signal.color = 'green';
+        signal.pendingPhase = null;
+        signal.elapsed = 0;
+        signal.waitAges[nextPhase] = 0;
+        if (nextPhase !== previousPhase) {
+          state.phaseChangeCount += 1;
+        }
+      }
+      continue;
+    }
+
     const scores = computeApproachScores(signal, queue, flow, availableApproaches);
     applyCoordinationBonus(node, scores, availableApproaches);
     const bestApproach = chooseBestApproach(availableApproaches, scores);
@@ -1557,7 +2994,7 @@ function updateSignals(dt, queueMetrics) {
         const start = getIntersectionById(r.from);
         const end = getIntersectionById(r.to);
         const len = start && end ? distance(start, end) : 0;
-        const cap = Math.max(2, len / (VEHICLE_LENGTH + SAFE_GAP));
+        const cap = Math.max(2, len / AVERAGE_VEHICLE_SPACING);
         const load = laneLoads.get(laneKey(r.from, r.to)) || 0;
         sum += clamp(load / cap, 0, 2);
       }
@@ -1622,42 +3059,91 @@ function updateSignals(dt, queueMetrics) {
 }
 
 function updateVehicles(dt) {
+  refreshPlannedNextLanes(state.vehicles);
   const gapMap = buildLaneGapMap();
-  const intersectionReservations = buildIntersectionReservations();
+  const intersectionReservations = buildIntersectionReservations(dt);
   const survivors = [];
 
   for (const vehicle of state.vehicles) {
     const tickStartProgress = vehicle.progress;
     let segment = getVehicleSegment(vehicle);
     if (!segment) {
-      continue;
-    }
-
-    let targetSpeed = segment.road.speedLimit;
-    const gap = gapMap.get(vehicle.id);
-
-    if (typeof gap === 'number') {
-      targetSpeed = Math.min(targetSpeed, Math.max(0, gap * 2.3));
-    }
-
-    const remainingDistance = segment.length * (1 - vehicle.progress);
-    const laneGreen = isLaneGreen(segment);
-    const reservationOwner = intersectionReservations.get(segment.endId);
-    const approachingIntersection = remainingDistance <= INTERSECTION_RESERVE_DISTANCE;
-    const intersectionBlocked =
-      approachingIntersection &&
-      reservationOwner &&
-      reservationOwner !== vehicle.id;
-    const canProceed = laneGreen && !intersectionBlocked;
-
-    if (!canProceed) {
-      const stopDistance = Math.max(0, remainingDistance - STOP_BUFFER);
-      if (stopDistance < 56) {
-        targetSpeed = Math.min(targetSpeed, stopDistance * 2.2);
+      const currentNodeId = vehicle.route[vehicle.segmentIndex] || vehicle.route[vehicle.route.length - 1];
+      const previousNodeId = vehicle.segmentIndex > 0 ? vehicle.route[vehicle.segmentIndex - 1] : null;
+      const repaired = rerouteVehicleFromNode(vehicle, currentNodeId, previousNodeId);
+      if (currentNodeId && currentNodeId === vehicle.route[vehicle.route.length - 1]) {
+        state.vehiclesCompleted += 1;
+        continue;
+      }
+      if (!repaired) {
+        survivors.push(vehicle);
+        continue;
+      }
+      segment = getVehicleSegment(vehicle);
+      if (!segment) {
+        survivors.push(vehicle);
+        continue;
       }
     }
 
-    const accelLimit = targetSpeed >= vehicle.speed ? ACCELERATION : DECELERATION;
+    const startingSpeed = vehicle.speed;
+    let targetSpeed = getVehicleTargetRoadSpeed(vehicle, segment.road);
+    const gap = gapMap.get(vehicle.id);
+    const withinIntersectionCarryWindow =
+      (vehicle.intersectionCarrySpeed ?? 0) > 0 &&
+      vehicle.progress < (vehicle.intersectionCarryUntilProgress ?? 0);
+
+    if (typeof gap === 'number' && !withinIntersectionCarryWindow) {
+      targetSpeed = Math.min(targetSpeed, Math.max(0, gap * 2.3));
+    }
+
+    if (withinIntersectionCarryWindow) {
+      const carrySpeed = Math.min(
+        getVehicleTargetRoadSpeed(vehicle, segment.road),
+        vehicle.intersectionCarrySpeed ?? 0
+      );
+      if (carrySpeed > 0) {
+        targetSpeed = Math.max(targetSpeed, carrySpeed);
+      }
+    } else {
+      vehicle.intersectionCarrySpeed = 0;
+      vehicle.intersectionCarryUntilProgress = 0;
+    }
+
+    const remainingDistance = segment.length * (1 - vehicle.progress);
+    const stopLineDistance = getVehicleStopDistance(vehicle, segment);
+    const commitDistance = getVehicleCommitDistance(vehicle, segment);
+    const committedToIntersection = remainingDistance <= commitDistance;
+    const laneGreen = isLaneGreen(segment, remainingDistance, vehicle);
+    const reservationOwner = intersectionReservations.get(segment.endId);
+    const approachingIntersection =
+      remainingDistance <= getVehicleReserveDistance(vehicle, segment) + Math.max(vehicle.speed, targetSpeed) * dt + 1;
+    const reservationIgnored = ignoresReservationForReverseLane(segment, reservationOwner);
+    const intersectionBlocked =
+      approachingIntersection &&
+      !committedToIntersection &&
+      reservationOwner &&
+      reservationOwner !== vehicle.id &&
+      !reservationIgnored;
+    const canProceed = (laneGreen || committedToIntersection) && !intersectionBlocked;
+    let brakingForControl = false;
+
+    if (!canProceed) {
+      const stopDistance = Math.max(0, remainingDistance - stopLineDistance);
+      if (stopDistance < 56) {
+        targetSpeed = Math.min(targetSpeed, stopDistance * 2.2);
+      }
+      brakingForControl = true;
+    }
+
+    if (targetSpeed < startingSpeed - 0.35) {
+      brakingForControl = true;
+    }
+
+    const accelLimit =
+      targetSpeed >= vehicle.speed
+        ? ACCELERATION * (vehicle.accelerationFactor ?? 1)
+        : DECELERATION * (vehicle.brakingFactor ?? 1);
     const diff = targetSpeed - vehicle.speed;
     const maxChange = accelLimit * dt;
     if (Math.abs(diff) > maxChange) {
@@ -1669,12 +3155,12 @@ function updateVehicles(dt) {
     let moveDistance = Math.max(0, vehicle.speed * dt);
 
     if (!canProceed) {
-      const stopDistance = Math.max(0, remainingDistance - STOP_BUFFER);
+      const stopDistance = Math.max(0, remainingDistance - stopLineDistance);
       moveDistance = Math.min(moveDistance, stopDistance);
     }
 
-    if (typeof gap === 'number') {
-      moveDistance = Math.min(moveDistance, Math.max(0, gap - SAFE_GAP));
+    if (typeof gap === 'number' && !withinIntersectionCarryWindow) {
+      moveDistance = Math.min(moveDistance, Math.max(0, gap - getVehicleSafeGap(vehicle)));
     }
 
     vehicle.progress += moveDistance / segment.length;
@@ -1685,27 +3171,54 @@ function updateVehicles(dt) {
     while (vehicle.progress >= 1) {
       const crossingIntersectionId = segment.endId;
       const crossingOwner = intersectionReservations.get(crossingIntersectionId);
-      const crossingGreen = isLaneGreen(segment);
+      const crossingIgnored = ignoresReservationForReverseLane(segment, crossingOwner);
+      const committedCrossing = tickStartProgress >= getCommitProgress(segment, vehicle);
+      const crossingGreen = isLaneGreen(segment, 0, vehicle);
+      const crossingReservedForVehicle =
+        !crossingOwner || crossingOwner === vehicle.id || crossingIgnored;
       const canEnterIntersection =
-        crossingGreen &&
-        (!crossingOwner || crossingOwner === vehicle.id);
+        crossingReservedForVehicle && (committedCrossing || crossingGreen);
 
       if (!canEnterIntersection) {
         const holdProgress = clamp(
-          Math.max(tickStartProgress, PRE_INTERSECTION_PROGRESS),
+          Math.max(tickStartProgress, getStopLineProgress(segment, vehicle)),
           0,
           0.9999
         );
         vehicle.progress = Math.min(vehicle.progress, holdProgress);
-        vehicle.speed = Math.min(vehicle.speed, INTERSECTION_HOLD_SPEED);
+        applyIntersectionHoldSpeed(vehicle, dt);
         haltedAtIntersection = true;
         break;
       }
 
       const overflow = (vehicle.progress - 1) * segment.length;
       const nextStartId = crossingIntersectionId;
-      const nextEndId = vehicle.route[vehicle.segmentIndex + 2];
-      const nextRoad = nextEndId ? findRoadBetween(nextStartId, nextEndId) : null;
+      let nextEndId = vehicle.route[vehicle.segmentIndex + 2];
+      let nextRoad = nextEndId ? findRoadBetween(nextStartId, nextEndId) : null;
+      if (nextEndId && !nextRoad) {
+        const repaired = rerouteVehicleFromNode(vehicle, nextStartId, segment.startId);
+        if (!repaired) {
+          const holdProgress = clamp(
+            Math.max(tickStartProgress, getStopLineProgress(segment, vehicle)),
+            0,
+            0.9999
+          );
+          vehicle.progress = Math.min(vehicle.progress, holdProgress);
+          applyIntersectionHoldSpeed(vehicle, dt);
+          haltedAtIntersection = true;
+          break;
+        }
+        segment = getVehicleSegment(vehicle);
+        if (!segment) {
+          arrived = vehicle.route[vehicle.route.length - 1] === nextStartId;
+          break;
+        }
+        nextEndId = vehicle.route[vehicle.segmentIndex + 1];
+        nextRoad = nextEndId ? findRoadBetween(nextStartId, nextEndId) : null;
+      }
+
+      const currentRoad = segment.road;
+
       if (nextEndId && nextRoad) {
         const nextStart = getIntersectionById(nextStartId);
         const nextEnd = getIntersectionById(nextEndId);
@@ -1715,29 +3228,22 @@ function updateVehicles(dt) {
         }
 
         const nextLength = Math.max(1, distance(nextStart, nextEnd));
-        const minEntryProgress = INTERSECTION_RELEASE_DISTANCE / nextLength;
+        const minEntryProgress =
+          getIntersectionReleaseDistance({ length: nextLength, road: nextRoad }, vehicle) / nextLength;
         const projectedProgress = clamp(
           Math.max(overflow / nextLength, minEntryProgress),
           0,
           0.98
         );
-        const requiredFrontProgress =
-          projectedProgress + (VEHICLE_LENGTH + SAFE_GAP) / nextLength;
-        const pickedLane = pickLaneWithSpace(
-          nextStartId,
-          nextEndId,
-          vehicle.id,
-          requiredFrontProgress,
-          nextRoad
-        );
+        const pickedLane = resolveVehicleNextLane(vehicle, segment, projectedProgress);
         if (pickedLane < 0) {
           const holdProgress = clamp(
-            Math.max(tickStartProgress, PRE_INTERSECTION_PROGRESS),
+            Math.max(tickStartProgress, getStopLineProgress(segment, vehicle)),
             0,
             0.9999
           );
           vehicle.progress = Math.min(vehicle.progress, holdProgress);
-          vehicle.speed = Math.min(vehicle.speed, INTERSECTION_HOLD_SPEED);
+          applyIntersectionHoldSpeed(vehicle, dt);
           haltedAtIntersection = true;
           break;
         }
@@ -1758,18 +3264,33 @@ function updateVehicles(dt) {
         arrived = true;
         break;
       }
+      const nextPlannedLane = pickVehicleNextLane(vehicle, segment);
+      vehicle.plannedNextLaneIndex = nextPlannedLane >= 0 ? nextPlannedLane : null;
 
-      const minExitProgress = INTERSECTION_RELEASE_DISTANCE / segment.length;
+      const minExitProgress = getIntersectionReleaseDistance(segment, vehicle) / segment.length;
       vehicle.progress = clamp(
         Math.max(overflow / segment.length, minExitProgress),
         0,
         0.98
+      );
+      const carryThroughSpeed = getVehicleCarryThroughSpeed(vehicle, currentRoad, segment.road);
+      vehicle.speed = Math.max(carryThroughSpeed, Math.min(vehicle.speed, getVehicleTargetRoadSpeed(vehicle, segment.road)));
+      vehicle.intersectionCarrySpeed = carryThroughSpeed;
+      vehicle.intersectionCarryUntilProgress = Math.max(
+        vehicle.progress,
+        getIntersectionExitProgress(segment, vehicle)
       );
     }
 
     if (haltedAtIntersection && vehicle.speed < 0.2) {
       vehicle.speed = 0;
     }
+
+    vehicle.brakeLightOn =
+      brakingForControl ||
+      haltedAtIntersection ||
+      vehicle.speed < startingSpeed - 0.35 ||
+      (vehicle.speed < 1.5 && targetSpeed < 4);
 
     if (arrived) {
       state.vehiclesCompleted += 1;
@@ -1779,10 +3300,15 @@ function updateVehicles(dt) {
   }
 
   state.vehicles = survivors;
-  enforceLaneSeparation(state.vehicles);
-  state.lastOverlapPairs = countVehicleOverlaps();
-  if (state.lastOverlapPairs > 0) {
-    state.collisionWarningTicks += 1;
+  refreshPlannedNextLanes(state.vehicles);
+  enforceLaneSeparation(state.vehicles, dt);
+  const overlapCheckInterval = getOverlapCheckInterval(state.vehicles.length);
+  state.overlapCheckCounter = (state.overlapCheckCounter + 1) % overlapCheckInterval;
+  if (state.overlapCheckCounter === 0) {
+    state.lastOverlapPairs = countVehicleOverlaps();
+    if (state.lastOverlapPairs > 0) {
+      state.collisionWarningTicks += 1;
+    }
   }
 }
 
@@ -1819,20 +3345,28 @@ function drawBackground() {
   gradient.addColorStop(1, '#102033');
   ctx.fillStyle = gradient;
   ctx.fillRect(0, 0, canvas.width, canvas.height);
+}
 
+function drawGrid() {
+  const bounds = getVisibleWorldBounds();
   ctx.strokeStyle = 'rgba(210, 228, 238, 0.06)';
-  ctx.lineWidth = 1;
+  ctx.lineWidth = 1 / state.view.zoom;
   const step = 42;
-  for (let x = 0; x <= canvas.width; x += step) {
+  const startX = Math.floor(bounds.minX / step) * step;
+  const endX = Math.ceil(bounds.maxX / step) * step;
+  const startY = Math.floor(bounds.minY / step) * step;
+  const endY = Math.ceil(bounds.maxY / step) * step;
+
+  for (let x = startX; x <= endX; x += step) {
     ctx.beginPath();
-    ctx.moveTo(x, 0);
-    ctx.lineTo(x, canvas.height);
+    ctx.moveTo(x, startY);
+    ctx.lineTo(x, endY);
     ctx.stroke();
   }
-  for (let y = 0; y <= canvas.height; y += step) {
+  for (let y = startY; y <= endY; y += step) {
     ctx.beginPath();
-    ctx.moveTo(0, y);
-    ctx.lineTo(canvas.width, y);
+    ctx.moveTo(startX, y);
+    ctx.lineTo(endX, y);
     ctx.stroke();
   }
 }
@@ -1926,7 +3460,13 @@ function drawIntersection(node) {
     for (const approach of APPROACH_ORDER) {
       if (!available.includes(approach)) continue;
       const sig = signals[approach];
-      ctx.fillStyle = node.signal.phase === approach ? '#74d48b' : '#f05d5e';
+      const signalColor = getApproachSignalColor(node, approach);
+      ctx.fillStyle =
+        signalColor === 'green'
+          ? '#74d48b'
+          : signalColor === 'yellow'
+          ? '#f6c445'
+          : '#f05d5e';
       ctx.fillRect(node.x + sig.x, node.y + sig.y, sig.w, sig.h);
     }
   }
@@ -1944,19 +3484,101 @@ function drawIntersections() {
   }
 }
 
+function traceVehicleTurnIndicator(turnIntent, length, width) {
+  ctx.beginPath();
+  if (turnIntent === 'left') {
+    ctx.moveTo(-length * 0.14, 0);
+    ctx.lineTo(-length * 0.01, 0);
+    ctx.lineTo(length * 0.08, -width * 0.32);
+    ctx.moveTo(length * 0.08, -width * 0.32);
+    ctx.lineTo(-length * 0.02, -width * 0.34);
+    ctx.moveTo(length * 0.08, -width * 0.32);
+    ctx.lineTo(length * 0.02, -width * 0.12);
+    return;
+  }
+  if (turnIntent === 'right') {
+    ctx.moveTo(-length * 0.14, 0);
+    ctx.lineTo(-length * 0.01, 0);
+    ctx.lineTo(length * 0.08, width * 0.32);
+    ctx.moveTo(length * 0.08, width * 0.32);
+    ctx.lineTo(-length * 0.02, width * 0.34);
+    ctx.moveTo(length * 0.08, width * 0.32);
+    ctx.lineTo(length * 0.02, width * 0.12);
+    return;
+  }
+  ctx.moveTo(-length * 0.12, 0);
+  ctx.lineTo(length * 0.14, 0);
+  ctx.moveTo(length * 0.14, 0);
+  ctx.lineTo(length * 0.03, -width * 0.16);
+  ctx.moveTo(length * 0.14, 0);
+  ctx.lineTo(length * 0.03, width * 0.16);
+}
+
 function drawVehicle(vehicle) {
   const pose = getVehicleWorldPose(vehicle);
   if (!pose) return;
+  const length = getVehicleLength(vehicle);
+  const width = getVehicleWidth(vehicle);
+  const turnIntent = getVehicleTurnIntent(vehicle);
+  const brakeLightOn = getVehicleBrakeLightState(vehicle);
 
   ctx.save();
   ctx.translate(pose.x, pose.y);
   ctx.rotate(pose.heading);
 
   ctx.fillStyle = 'rgba(9, 15, 23, 0.44)';
-  ctx.fillRect(-VEHICLE_LENGTH * 0.5 - 1, -4, VEHICLE_LENGTH + 2, 8);
+  ctx.beginPath();
+  ctx.moveTo(length * 0.54, 0);
+  ctx.lineTo(-length * 0.52, width * 0.72);
+  ctx.lineTo(-length * 0.7, 0);
+  ctx.lineTo(-length * 0.52, -width * 0.72);
+  ctx.closePath();
+  ctx.fill();
 
   ctx.fillStyle = vehicle.color;
-  ctx.fillRect(-VEHICLE_LENGTH * 0.5, -3, VEHICLE_LENGTH, 6);
+  ctx.beginPath();
+  ctx.moveTo(length * 0.5, 0);
+  ctx.lineTo(-length * 0.45, width * 0.5);
+  ctx.lineTo(-length * 0.45, -width * 0.5);
+  ctx.closePath();
+  ctx.fill();
+
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.58)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(length * 0.1, 0);
+  ctx.lineTo(-length * 0.28, 0);
+  ctx.stroke();
+
+  ctx.strokeStyle = 'rgba(8, 16, 24, 0.92)';
+  ctx.lineWidth = 2.6;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  traceVehicleTurnIndicator(turnIntent, length, width);
+  ctx.stroke();
+
+  ctx.strokeStyle = turnIntent === 'straight' ? '#fff8c2' : '#ffd166';
+  ctx.lineWidth = 1.25;
+  traceVehicleTurnIndicator(turnIntent, length, width);
+  ctx.stroke();
+
+  const brakeGlow = brakeLightOn ? 'rgba(255, 82, 82, 0.95)' : 'rgba(120, 36, 36, 0.45)';
+  const brakeCore = brakeLightOn ? '#ffd0d0' : '#7d3030';
+  const brakeRadius = Math.max(1.35, width * 0.14);
+  const rearX = -length * 0.36;
+  const rearY = width * 0.24;
+
+  ctx.fillStyle = brakeGlow;
+  ctx.beginPath();
+  ctx.arc(rearX, -rearY, brakeRadius, 0, Math.PI * 2);
+  ctx.arc(rearX, rearY, brakeRadius, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.fillStyle = brakeCore;
+  ctx.beginPath();
+  ctx.arc(rearX, -rearY, brakeRadius * 0.45, 0, Math.PI * 2);
+  ctx.arc(rearX, rearY, brakeRadius * 0.45, 0, Math.PI * 2);
+  ctx.fill();
 
   ctx.restore();
 }
@@ -1975,7 +3597,7 @@ function drawHud() {
   }[state.mode];
 
   ctx.fillStyle = 'rgba(6, 13, 20, 0.52)';
-  ctx.fillRect(12, 12, 360, 60);
+  ctx.fillRect(12, 12, 430, 82);
 
   ctx.fillStyle = '#e7f2fb';
   ctx.font = '15px "Space Grotesk", sans-serif';
@@ -1987,20 +3609,30 @@ function drawHud() {
     20,
     44
   );
+  ctx.fillText(
+    `View: ${Math.round(state.view.zoom * 100)}% | Wheel: zoom | Drag empty space: pan`,
+    20,
+    66
+  );
 
   if (state.mode === 'connect-roads' && state.connectStartId) {
     ctx.fillStyle = 'rgba(251, 133, 0, 0.65)';
-    ctx.fillRect(12, 80, 390, 28);
+    ctx.fillRect(12, 104, 390, 28);
     ctx.fillStyle = '#fff6ea';
-    ctx.fillText(`Connect from ${state.connectStartId}: click another intersection`, 18, 88);
+    ctx.fillText(`Connect from ${state.connectStartId}: click another intersection`, 18, 112);
   }
 }
 
 function render() {
   drawBackground();
+  ctx.save();
+  ctx.translate(state.view.x, state.view.y);
+  ctx.scale(state.view.zoom, state.view.zoom);
+  drawGrid();
   drawRoads();
-  drawVehicles();
   drawIntersections();
+  drawVehicles();
+  ctx.restore();
   drawHud();
   updateStats();
 }
@@ -2036,6 +3668,7 @@ function updateStats() {
     `avg_speed_px_s: ${round(getAverageSpeed(), 1)}`,
     `queued_vehicles: ${totalQueue}`,
     `largest_queue_at: ${hotSpot || 'n/a'}`,
+    `vehicle_mix: ${buildVehicleMixSummary() || 'n/a'}`,
     `overlap_pairs: ${state.lastOverlapPairs}`,
     `collision_warning_ticks: ${state.collisionWarningTicks}`,
   ];
@@ -2048,6 +3681,7 @@ function buildTrafficSnapshot() {
     const queue = state.lastQueueMetrics.get(node.id) || makeEmptyQueue();
     const flow = state.lastFlowMetrics.get(node.id) || makeEmptyQueue();
     ensureSignalWaitAges(node.signal);
+    ensureSignalCycleState(node.signal);
     return {
       id: node.id,
       x: round(node.x, 1),
@@ -2056,6 +3690,8 @@ function buildTrafficSnapshot() {
       exit_weight: round(node.exitWeight, 2),
       signal: {
         phase: node.signal.phase,
+        color: node.signal.color,
+        pending_phase: node.signal.pendingPhase,
         mode: node.signal.mode,
         available_approaches: getIntersectionApproaches(node.id),
         elapsed_s: round(node.signal.elapsed, 2),
@@ -2090,7 +3726,7 @@ function buildTrafficSnapshot() {
     const start = getIntersectionById(road.from);
     const end = getIntersectionById(road.to);
     const length = start && end ? distance(start, end) : 0;
-    const capacity = Math.max(2, length / (VEHICLE_LENGTH + SAFE_GAP));
+    const capacity = Math.max(2, length / AVERAGE_VEHICLE_SPACING);
     const loadFwd = laneLoads.get(laneKey(road.from, road.to)) || 0;
     const loadRev = laneLoads.get(laneKey(road.to, road.from)) || 0;
     const occupancyFwd = round(clamp(loadFwd / capacity, 0, 2), 2);
@@ -2111,19 +3747,33 @@ function buildTrafficSnapshot() {
     const segment = getVehicleSegment(vehicle);
     return {
       id: vehicle.id,
+      type: vehicle.type,
+      label: vehicle.label,
+      lane_style: vehicle.laneStyle || 'normal',
+      lane_drift_px: round(getVehicleLaneDrift(vehicle), 2),
+      turn_intent: getVehicleTurnIntent(vehicle),
+      brake_light_on: getVehicleBrakeLightState(vehicle),
       lane_from: segment?.startId || null,
       lane_to: segment?.endId || null,
+      lane_index: vehicle.laneIndex ?? 0,
       progress: round(vehicle.progress, 3),
       speed: round(vehicle.speed, 2),
+      length: round(getVehicleLength(vehicle), 1),
+      width: round(getVehicleWidth(vehicle), 1),
       route_end: vehicle.route[vehicle.route.length - 1] || null,
     };
   });
 
   return {
-    coordinate_system: 'origin=(top-left), +x=right, +y=down, units=canvas pixels',
+    coordinate_system: 'origin=(top-left), +x=right, +y=down, units=world pixels',
     mode: state.mode,
     running: state.running,
     time_s: round(state.simulationTime, 2),
+    view: {
+      offset_x: round(state.view.x, 2),
+      offset_y: round(state.view.y, 2),
+      zoom: round(state.view.zoom, 3),
+    },
     spawn: {
       mode: state.spawnMode,
       rate_per_min: state.spawnRatePerMinute,
@@ -2158,6 +3808,10 @@ function advanceTime(ms) {
 }
 
 function resizeCanvas() {
+  const previousCenter =
+    canvas.width > 0 && canvas.height > 0
+      ? screenToWorld(canvas.width * 0.5, canvas.height * 0.5)
+      : null;
   const bounds = ui.stageWrap.getBoundingClientRect();
   const width = Math.max(720, Math.floor(bounds.width - 2));
   const height = Math.max(520, Math.floor(bounds.height - 2));
@@ -2165,6 +3819,10 @@ function resizeCanvas() {
   if (canvas.width !== width || canvas.height !== height) {
     canvas.width = width;
     canvas.height = height;
+    if (previousCenter) {
+      state.view.x = canvas.width * 0.5 - previousCenter.x * state.view.zoom;
+      state.view.y = canvas.height * 0.5 - previousCenter.y * state.view.zoom;
+    }
   }
 }
 
@@ -2204,6 +3862,15 @@ function buildSampleGrid() {
     center.exitWeight = 2;
   }
 
+  state.currentScenarioId = 'sample-grid';
+  state.vehiclesCompleted = 0;
+  state.simulationTime = 0;
+  state.spawnAccumulator = 0;
+  state.lastQueueMetrics = new Map();
+  state.lastFlowMetrics = new Map();
+  state.pendingAgentDecision = false;
+  state.lastAgentDecisionAt = 0;
+  focusViewOnMap();
   renderWeightTable();
   renderInspector();
 }
@@ -2250,10 +3917,18 @@ function buildScenario(scenarioId) {
     if (cNode) { cNode.entryWeight = 3; cNode.exitWeight = 2; }
   } else if (scenarioId === 'star') {
     const c = add(cx, cy);
-    const n = add(cx, cy - d), s = add(cx, cy + d), e = add(cx + d, cy), w = add(cx - d, cy);
+    const n = add(cx, cy - d);
+    const s = add(cx, cy + d);
+    const e = add(cx + d, cy);
+    const w = add(cx - d, cy);
+    const ne = add(cx + d * 0.78, cy - d * 0.78);
+    const nw = add(cx - d * 0.78, cy - d * 0.78);
+    const se = add(cx + d * 0.78, cy + d * 0.78);
+    const sw = add(cx - d * 0.78, cy + d * 0.78);
     link(c, n); link(c, s); link(c, e); link(c, w);
+    link(c, ne); link(c, nw); link(c, se); link(c, sw);
     const cNode = getIntersectionById(c);
-    if (cNode) { cNode.entryWeight = 2; cNode.exitWeight = 2; }
+    if (cNode) { cNode.entryWeight = 3; cNode.exitWeight = 2; }
   } else if (scenarioId === 'diamond') {
     const t = add(cx, cy - d), b = add(cx, cy + d), l = add(cx - d, cy), r = add(cx + d, cy), c = add(cx, cy);
     link(c, t); link(c, b); link(c, l); link(c, r);
@@ -2285,6 +3960,7 @@ function buildScenario(scenarioId) {
   state.lastFlowMetrics = new Map();
   state.pendingAgentDecision = false;
   state.lastAgentDecisionAt = 0;
+  focusViewOnMap();
   renderWeightTable();
   renderInspector();
 }
@@ -2330,7 +4006,12 @@ function attachUiEvents() {
   });
 
   ui.sampleGrid?.addEventListener('click', () => {
-    buildSampleGrid();
+    loadScenarioPreset('sample-grid');
+  });
+
+  ui.scenarioPreset?.addEventListener('change', (event) => {
+    loadScenarioPreset(event.target.value);
+    render();
   });
 
   ui.spawnMode?.addEventListener('change', (event) => {
@@ -2346,6 +4027,28 @@ function attachUiEvents() {
   ui.autoSpawn?.addEventListener('change', (event) => {
     state.autoSpawn = Boolean(event.target.checked);
     updateSpawnControls();
+  });
+
+  ui.scenarioLanes?.addEventListener('change', (event) => {
+    const value = String(event.target.value || '');
+    if (value === 'mixed') {
+      updateScenarioLaneControl();
+      return;
+    }
+    setAllRoadLanes(value);
+    renderInspector();
+    render();
+  });
+
+  ui.globalSignalMode?.addEventListener('change', (event) => {
+    const nextMode = normalizeSignalMode(event.target.value, '');
+    if (!nextMode) {
+      updateGlobalSignalModeControl();
+      return;
+    }
+    window.setAllSignalModes(nextMode);
+    renderInspector();
+    render();
   });
 
   ui.weightTable?.addEventListener('input', (event) => {
@@ -2387,21 +4090,7 @@ function attachUiEvents() {
       }
       if (key === 'signalMode') {
         const nextMode = String(event.target.value || 'none');
-        node.signal.mode = ['none', 'adaptive', 'fixed', 'external', 'rl'].includes(nextMode)
-          ? nextMode
-          : 'none';
-        ensureSignalWaitAges(node.signal);
-        if (node.signal.mode === 'none') {
-          node.signal.elapsed = 0;
-          for (const approach of APPROACH_ORDER) {
-            node.signal.waitAges[approach] = 0;
-          }
-        } else {
-          const available = getIntersectionApproaches(node.id);
-          if (available.length > 0 && !available.includes(node.signal.phase)) {
-            node.signal.phase = available[0];
-          }
-        }
+        setIntersectionSignalMode(node, nextMode);
         renderInspector();
       }
       if (key === 'phaseDirection') {
@@ -2430,9 +4119,11 @@ function attachUiEvents() {
         const newLanes = clamp(Number(event.target.value) || 2, 1, 8);
         const oldLanes = road.lanes ?? 2;
         road.lanes = newLanes;
+        state.defaultRoadLanes = newLanes;
         if (newLanes > 1 && newLanes !== oldLanes) {
           redistributeVehiclesOnRoad(road);
         }
+        updateScenarioLaneControl();
       }
     }
   });
@@ -2464,7 +4155,9 @@ function attachUiEvents() {
   canvas.addEventListener('mousemove', handleCanvasPointerMove);
   canvas.addEventListener('mouseup', handleCanvasPointerUp);
   canvas.addEventListener('mouseleave', handleCanvasPointerUp);
+  canvas.addEventListener('wheel', handleCanvasWheel, { passive: false });
   canvas.addEventListener('contextmenu', (event) => event.preventDefault());
+  window.addEventListener('mouseup', handleCanvasPointerUp);
 
   window.addEventListener('resize', () => {
     resizeCanvas();
@@ -2532,6 +4225,7 @@ window.setTrafficLightAgent = (agentFn) => {
 window.setRlTrafficLightAgent = (agentFn) => {
   state.rlTrafficLightAgent = typeof agentFn === 'function' ? agentFn : null;
 };
+window.getOverlapDiagnostics = (limit = 10) => collectVehicleOverlaps(limit);
 window.stepSimulation = stepSimulation;
 window.clearMap = clearMap;
 window.buildSampleGrid = buildSampleGrid;
@@ -2541,11 +4235,17 @@ window.getRewardMetrics = () => {
   for (const q of state.lastQueueMetrics.values()) {
     totalQueue += (q.N || 0) + (q.E || 0) + (q.S || 0) + (q.W || 0);
   }
+  const avgSpeed = getAverageSpeed();
+  const stoppedVehicles = state.vehicles.reduce((sum, vehicle) => sum + (vehicle.speed < 6 ? 1 : 0), 0);
   return {
     vehiclesCompleted: state.vehiclesCompleted,
     totalQueue,
     phaseChanges: state.phaseChangeCount,
     vehiclesActive: state.vehicles.length,
+    avgSpeed,
+    stoppedVehicles,
+    overlapPairs: state.lastOverlapPairs,
+    collisionWarnings: state.collisionWarningTicks,
     time_s: state.simulationTime,
   };
 };
@@ -2577,10 +4277,20 @@ window.clearBacktestSeed = () => {
   state.backtestSeed = null;
 };
 window.setAllSignalModes = (mode) => {
+  const nextMode = normalizeSignalMode(mode, 'adaptive');
   for (const node of state.intersections) {
-    node.signal.mode = ['none', 'adaptive', 'fixed', 'external', 'rl'].includes(mode) ? mode : 'adaptive';
-    if (node.signal.mode === 'none') node.signal.elapsed = 0;
+    setIntersectionSignalMode(node, nextMode);
   }
+  updateGlobalSignalModeControl();
+};
+window.setAllRoadLanes = (lanes) => {
+  setAllRoadLanes(lanes);
+  renderInspector();
+  render();
+};
+window.loadScenarioPreset = (preset) => {
+  loadScenarioPreset(preset);
+  render();
 };
 window.setFixedGreenForAll = (seconds) => {
   const s = clamp(Number(seconds) || 8, 2, 90);
@@ -2595,6 +4305,9 @@ function init() {
   resizeCanvas();
   attachUiEvents();
   ensureStarterScenario();
+  updateGlobalSignalModeControl();
+  updateScenarioPresetControl();
+  updateScenarioLaneControl();
   updateModeButtons();
   updateSpawnControls();
   updateRunButton();
