@@ -43,6 +43,28 @@
       .backtest-winner.rl { background: rgba(173, 127, 255, 0.3); }
       .backtest-winner.tie { background: rgba(107, 128, 149, 0.3); }
       #backtest-log { font-size: 11px; max-height: 180px; overflow-y: auto; }
+      .config-tabs {
+        display: flex;
+        gap: 0;
+        margin-bottom: 0;
+        border-bottom: 1px solid rgba(107, 128, 149, 0.4);
+      }
+      .config-tabs button {
+        padding: 0.5rem 1rem;
+        background: transparent;
+        border: none;
+        border-bottom: 2px solid transparent;
+        color: var(--muted);
+        cursor: pointer;
+        font-size: 0.85rem;
+      }
+      .config-tabs button:hover { color: var(--text); }
+      .config-tabs button.active {
+        color: var(--accent);
+        border-bottom-color: var(--accent);
+      }
+      .config-tab-panel { display: none; }
+      .config-tab-panel.active { display: block; }
       .scenario-table { width: 100%; font-size: 12px; margin-top: 1rem; border-collapse: collapse; }
       .scenario-table th, .scenario-table td { padding: 6px 8px; text-align: left; border: 1px solid rgba(107, 128, 149, 0.4); }
       .scenario-table th { background: rgba(15, 31, 46, 0.8); }
@@ -61,16 +83,30 @@
           <p>Compare Adaptive AI, External AI, and RL control at 120 vehicles/min spawn rate.</p>
         </header>
 
+        <div class="config-tabs">
+          <button type="button" data-tab="backtest" class="active">Backtest</button>
+          <button type="button" data-tab="config">Configuration</button>
+        </div>
+
+        <div id="tab-backtest" class="config-tab-panel active">
         <section class="group backtest-panel">
           <h2>Backtest</h2>
           <p class="tiny">Runs 3 min per scenario per mode at 120/min spawn, 3 trials averaged per scenario. Tests 8 road designs. Compares Adaptive AI, External AI (pressure-based), RL Agent (trained or heuristic fallback), and Static (fixed 30s cycle, typical real-life). Uses seeded RNG for reproducible results.</p>
           <div class="button-row">
             <button id="run-backtest">Run All Scenarios</button>
           </div>
+          <div class="row" style="margin-top: 0.5rem;">
+            <label>
+              <input id="hide-animation" type="checkbox" />
+              Hide animation (faster)
+            </label>
+          </div>
           <pre id="backtest-log"></pre>
           <div id="backtest-results" class="backtest-results" style="display: none;"></div>
         </section>
+        </div>
 
+        <div id="tab-config" class="config-tab-panel">
         <section class="group">
           <h2>Simulation</h2>
           <p class="tiny">Spawn rate is set to 120/min during backtest.</p>
@@ -98,6 +134,7 @@
           <h2>Stats</h2>
           <pre id="stats" class="stats"></pre>
         </section>
+        </div>
       </aside>
 
       <main id="stage-wrap" aria-label="Traffic simulation stage">
@@ -112,6 +149,17 @@
 
       const rlRuntime = await attachRlRuntime(window, { storageKey: 'main', eligibleMode: 'rl' });
       const BACKTEST_DURATION_S = 180;
+
+      document.querySelectorAll('.config-tabs button').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const tab = btn.dataset.tab;
+          document.querySelectorAll('.config-tabs button').forEach((b) => b.classList.remove('active'));
+          document.querySelectorAll('.config-tab-panel').forEach((p) => p.classList.remove('active'));
+          btn.classList.add('active');
+          const panel = document.getElementById(`tab-${tab}`);
+          if (panel) panel.classList.add('active');
+        });
+      });
       const BACKTEST_TRIALS = 3;
 
       function scenarioSeed(scenarioId, trial) {
@@ -241,22 +289,31 @@
         }
       }
 
-      function runOneMode(mode, label, scenarioId, seed) {
+      async function runOneMode(mode, label, scenarioId, seed, hideAnimation) {
+        window.buildScenario(scenarioId || 'grid3x3');
+        window.setSpawnRate(SPAWN_RATE);
+        window.setBacktestSeed(seed);
+        window.setAllSignalModes(mode);
+
+        if (mode === 'external') {
+          window.setTrafficLightAgent(createPressureBasedAgent());
+        } else {
+          window.setTrafficLightAgent(null);
+        }
+        if (mode === 'fixed') {
+          window.setFixedGreenForAll(30);
+        }
+
+        if (hideAnimation) {
+          for (let steps = 0; steps < BACKTEST_DURATION_S; steps += 1) {
+            window.stepSimulation(1);
+            if (steps > 0 && steps % 15 === 0) {
+              await new Promise((r) => requestAnimationFrame(r));
+            }
+          }
+          return { label, ...window.getBacktestMetrics() };
+        }
         return new Promise((resolve) => {
-          window.buildScenario(scenarioId || 'grid3x3');
-          window.setSpawnRate(SPAWN_RATE);
-          window.setBacktestSeed(seed);
-          window.setAllSignalModes(mode);
-
-          if (mode === 'external') {
-            window.setTrafficLightAgent(createPressureBasedAgent());
-          } else {
-            window.setTrafficLightAgent(null);
-          }
-          if (mode === 'fixed') {
-            window.setFixedGreenForAll(30);
-          }
-
           let steps = 0;
           const step = () => {
             window.stepSimulation(1);
@@ -264,8 +321,7 @@
             if (steps < BACKTEST_DURATION_S) {
               requestAnimationFrame(step);
             } else {
-              const m = window.getBacktestMetrics();
-              resolve({ label, ...m });
+              resolve({ label, ...window.getBacktestMetrics() });
             }
           };
           requestAnimationFrame(step);
@@ -274,10 +330,15 @@
 
       document.getElementById('run-backtest').addEventListener('click', async () => {
         const btn = document.getElementById('run-backtest');
+        const hideAnimation = document.getElementById('hide-animation')?.checked ?? false;
         btn.disabled = true;
         document.getElementById('backtest-log').textContent = '';
         document.getElementById('backtest-results').style.display = 'none';
 
+        if (hideAnimation) {
+          window.setRenderEnabled?.(false, { pauseSimulation: true });
+        }
+        try {
         log(`Starting multi-scenario backtest @ 120/min, 3 min per run, ${BACKTEST_TRIALS} trials per scenario...`);
         log(rlRuntime.loaded ? 'RL model loaded from IndexedDB.' : 'RL model missing; using heuristic fallback.');
         const results = [];
@@ -289,10 +350,10 @@
           for (let t = 0; t < BACKTEST_TRIALS; t++) {
             const seed = scenarioSeed(scenario.id, t);
             log(`  Trial ${t + 1}/${BACKTEST_TRIALS}...`);
-            const adaptive = await runOneMode('adaptive', 'Adaptive', scenario.id, seed);
-            const external = await runOneMode('external', 'External', scenario.id, seed);
-            const rl = await runOneMode('rl', 'RL', scenario.id, seed);
-            const static_ = await runOneMode('fixed', 'Static', scenario.id, seed);
+            const adaptive = await runOneMode('adaptive', 'Adaptive', scenario.id, seed, hideAnimation);
+            const external = await runOneMode('external', 'External', scenario.id, seed, hideAnimation);
+            const rl = await runOneMode('rl', 'RL', scenario.id, seed, hideAnimation);
+            const static_ = await runOneMode('fixed', 'Static', scenario.id, seed, hideAnimation);
             adaptiveSum += adaptive.vehiclesCompleted;
             externalSum += external.vehiclesCompleted;
             rlSum += rl.vehiclesCompleted;
@@ -400,7 +461,15 @@
         winnerEl.style.gridColumn = '1 / -1';
         resultsDiv.appendChild(winnerEl);
 
-        btn.disabled = false;
+        } catch (error) {
+          console.error(error);
+          log(`Backtest error: ${error.message}`);
+        } finally {
+          if (hideAnimation) {
+            window.setRenderEnabled?.(true, { pauseSimulation: false });
+          }
+          btn.disabled = false;
+        }
       });
     </script>
   </body>

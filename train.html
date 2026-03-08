@@ -83,6 +83,10 @@
               UI refresh every steps
               <input id="refresh-every" type="number" min="1" step="1" value="15" />
             </label>
+            <label>
+              <input id="hide-animation" type="checkbox" />
+              Hide animation (faster)
+            </label>
           </div>
           <div class="inline">
             <label>
@@ -185,6 +189,7 @@
         updateEvery: document.getElementById('update-every'),
         episodeSeconds: document.getElementById('episode-seconds'),
         refreshEvery: document.getElementById('refresh-every'),
+        hideAnimation: document.getElementById('hide-animation'),
         spawnRate: document.getElementById('train-spawn-rate'),
         scenarioStrategy: document.getElementById('scenario-strategy'),
         focusScenario: document.getElementById('focus-scenario'),
@@ -463,10 +468,14 @@
       async function train() {
         const totalEpisodes = Math.max(1, Number(ui.episodes.value) || 1);
         const updateEvery = Math.max(1, Number(ui.updateEvery.value) || 4);
+        const hideAnimation = ui.hideAnimation?.checked ?? false;
         training = true;
         ui.start.disabled = true;
         setStatus('Training in progress');
         log(`Starting training for ${totalEpisodes} episode(s).`);
+        if (hideAnimation) {
+          window.setRenderEnabled?.(false, { pauseSimulation: true });
+        }
 
         for (let episode = 0; episode < totalEpisodes && training; episode += 1) {
           const result = await runEpisode(episode);
@@ -517,6 +526,9 @@
         training = false;
         ui.start.disabled = false;
         setStatus('Training idle');
+        if (hideAnimation) {
+          window.setRenderEnabled?.(true, { pauseSimulation: false });
+        }
       }
 
       ui.start.addEventListener('click', async () => {
@@ -529,6 +541,7 @@
           training = false;
           ui.start.disabled = false;
           setStatus('Training failed');
+          window.setRenderEnabled?.(true, { pauseSimulation: false });
         }
       });
 

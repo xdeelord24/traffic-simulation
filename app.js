@@ -172,6 +172,7 @@ const state = {
   dragPanMoved: false,
   dragPanAllowsDeselect: false,
   overlapCheckCounter: 0,
+  renderEnabled: true,
 };
 
 function seededRandom() {
@@ -4407,7 +4408,9 @@ function frame(timestamp) {
     stepSimulation(dt);
   }
 
-  render();
+  if (state.renderEnabled) {
+    render();
+  }
   requestAnimationFrame(frame);
 }
 
@@ -4471,6 +4474,16 @@ window.setBacktestSeed = (seed) => {
 };
 window.clearBacktestSeed = () => {
   state.backtestSeed = null;
+};
+window.setRenderEnabled = (enabled, options = {}) => {
+  state.renderEnabled = !!enabled;
+  if (options.pauseSimulation) {
+    state.savedRunning = state.running;
+    state.running = false;
+  } else if (options.pauseSimulation === false && state.savedRunning !== undefined) {
+    state.running = state.savedRunning;
+    state.savedRunning = undefined;
+  }
 };
 window.setAllSignalModes = (mode) => {
   const nextMode = normalizeSignalMode(mode, 'adaptive');
